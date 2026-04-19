@@ -1,7 +1,5 @@
 // modules/chat-processor.js
 const { CONFIG } = require('../config');
-const { getCache, setCache } = require('./cache');
-const { getChatHistory, saveChatMessage } = require('./database');
 const { selectModel, callWithFallback } = require('./ai-models');
 const { processImageInput } = require('./ocr');
 const { getGreetingResponse } = require('./greetings');
@@ -21,9 +19,22 @@ async function buildSystemPrompt(level, userId, userMessage) {
   return prompt;
 }
 
-async function processChat(userId, platform, level, message, imageUrl = null, isPDF = false, pageCount = 1) {
+/**
+ * Proses chat dengan menerima cache dan db dari container
+ * @param {string} userId - ID user
+ * @param {string} platform - 'telegram' atau 'whatsapp'
+ * @param {string} level - level pendidikan user
+ * @param {string} message - pesan user
+ * @param {string|null} imageUrl - URL gambar (opsional)
+ * @param {boolean} isPDF - apakah file PDF
+ * @param {number} pageCount - jumlah halaman PDF
+ * @param {object} cache - object cache dengan method get, set
+ * @param {object} db - object database dengan method getChatHistory, saveChatMessage
+ * @returns {Promise<{success: boolean, content: string, model?: string, isFallback?: boolean}>}
+ */
+async function processChat(userId, platform, level, message, imageUrl = null, isPDF = false, pageCount = 1, cache, db) {
   const startTime = Date.now();
-  
+
   // Handle gambar/PDF
   if (imageUrl) {
     let targetModel = level === 'sd_smp' ? 'deepseekV32' : (level === 'sma' ? 'deepseekV32' : (level === 'mahasiswa' ? 'deepseekReasoning' : 'gpt5'));
@@ -31,37 +42,38 @@ async function processChat(userId, platform, level, message, imageUrl = null, is
     if (imageResult.success) return { success: true, content: imageResult.content, model: targetModel };
     return { success: true, content: imageResult.content, model: 'system', isFallback: true };
   }
-  
+
   // Handle sapaan
   const greetingResponse = getGreetingResponse(message, level);
   if (greetingResponse) return { success: true, content: greetingResponse, model: 'system' };
-  
+
   try {
     const cacheKey = `chat:${level}:${message}`;
-    const cached = await getCache(cacheKey);
+    const cached = await cache.get(cacheKey);
     if (cached) return cached;
-    
+
     const { model: selectedModel } = selectModel(level);
-    const history = await getChatHistory(userId, platform, 5);
+    // Ambil history dari database (perlu fungsi getChatHistory di db)
+    const history = await db.getChatHistory(userId, platform, 5);
     const systemPrompt = await buildSystemPrompt(level, userId, message);
     const messages = [{ role: 'system', content: systemPrompt }];
-    
+
     for (const h of history) {
       messages.push({ role: h.role, content: h.content.substring(0, 500) });
     }
     messages.push({ role: 'user', content: message });
-    
+
     const isArticle = (level === 'sd_smp' || level === 'sma') && 
       (message.toLowerCase().includes('artikel') || message.toLowerCase().includes('tulisan'));
-    
+
     const result = await callWithFallback(selectedModel, messages, level, isArticle);
-    
+
     if (message.length > 3 && result.content.length > 10) {
-      await saveChatMessage(userId, platform, 'user', message.substring(0, 500), selectedModel);
-      await saveChatMessage(userId, platform, 'assistant', result.content.substring(0, 1000), result.model);
+      await db.saveChatMessage(userId, platform, 'user', message.substring(0, 500), selectedModel);
+      await db.saveChatMessage(userId, platform, 'assistant', result.content.substring(0, 1000), result.model);
     }
-    
-    await setCache(cacheKey, result, 3600);
+
+    await cache.set(cacheKey, result, 3600);
     console.log(`✅ Completed in ${Date.now() - startTime}ms`);
     return result;
   } catch (error) {
