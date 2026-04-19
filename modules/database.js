@@ -1,7 +1,6 @@
 // modules/database.js
 const { createClient } = require('@supabase/supabase-js');
 const { CONFIG } = require('../config');
-const { getCache, setCache } = require('./cache');
 
 let supabase = null;
 
