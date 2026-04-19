@@ -1,19 +1,11 @@
-// ============================================
-// INDEX.JS - YENNI AI BACKEND v3.0
-// MULTI PLATFORM: TELEGRAM + WHATSAPP + WEB
-// ============================================
-
 require('dotenv').config();
-const express = require('express');
-const cron = require('nrequire('dotenv').config();
 const express = require('express');
 const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
 const crypto = require('crypto');
-const Queue = require('bull');
-const Redis = require('ioredis');
+const redis = require('redis');
 
 // Services
 const { initSupabase } = require('./modules/database');
@@ -55,50 +47,67 @@ function logWebhook(level, message, req, meta = {}) {
 }
 
 // ==========================
-// REDIS CONNECTION (POOL)
+// REDIS CONNECTION
 // ==========================
-const redisClient = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-  maxRetriesPerRequest: 3,
-  retryStrategy: (times) => Math.min(times * 50, 2000)
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 });
 
 redisClient.on('error', (err) => log('error', 'Redis error', { error: err.message }));
 redisClient.on('connect', () => log('info', 'Redis connected'));
 
+// Koneksi ke Redis (async)
+(async () => {
+  await redisClient.connect();
+})();
+
 // ==========================
-// QUEUE SETUP
+// SIMPLE QUEUE (MANUAL)
 // ==========================
-const telegramQueue = new Queue('telegram', { createClient: () => redisClient });
-const whatsappQueue = new Queue('whatsapp', { createClient: () => redisClient });
+const QUEUE_KEYS = {
+  telegram: 'queue:telegram',
+  whatsapp: 'queue:whatsapp'
+};
 
-// Konfigurasi queue
-telegramQueue.process(20, async (job) => {  // 20 job concurrently
-  const { payload, requestId } = job.data;
-  const fakeReq = {
-    body: payload,
-    id: requestId,
-    container: { db: container.db, cache: container.cache } // pass global container
+// Menambahkan job ke antrian
+async function enqueue(platform, payload, requestId) {
+  const job = {
+    id: `${Date.now()}:${requestId}`,
+    payload,
+    createdAt: new Date().toISOString(),
+    attempts: 0
   };
-  await telegramController(fakeReq, null);
-});
+  await redisClient.lPush(QUEUE_KEYS[platform], JSON.stringify(job));
+  log('debug', `Enqueued ${platform} job`, { jobId: job.id });
+}
 
-whatsappQueue.process(20, async (job) => {
-  const { payload, requestId } = job.data;
-  const fakeReq = {
-    body: payload,
-    id: requestId,
-    container: { db: container.db, cache: container.cache }
-  };
-  await whatsappController(fakeReq, null);
-});
-
-// Event monitoring
-telegramQueue.on('failed', (job, err) => {
-  log('error', 'Telegram job failed', { jobId: job.id, error: err.message });
-});
-whatsappQueue.on('failed', (job, err) => {
-  log('error', 'WhatsApp job failed', { jobId: job.id, error: err.message });
-});
+// Worker: proses antrian (jalan terus di background)
+async function processQueue(platform, handler) {
+  while (true) {
+    try {
+      const jobStr = await redisClient.rPop(QUEUE_KEYS[platform]);
+      if (!jobStr) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      const job = JSON.parse(jobStr);
+      log('info', `Processing ${platform} job`, { jobId: job.id });
+      
+      const fakeReq = {
+        body: job.payload,
+        id: job.id,
+        container: { db: container.db, cache: container.cache },
+        path: `/${platform}`
+      };
+      
+      await handler(fakeReq, null);
+      log('info', `Job ${platform} completed`, { jobId: job.id });
+    } catch (err) {
+      log('error', `Worker error for ${platform}`, { error: err.message });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+}
 
 // ==========================
 // MIDDLEWARE
@@ -114,7 +123,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Container global (read-only)
 const container = { cache: null, db: null, ready: false, shuttingDown: false };
 app.use((req, res, next) => {
   req.container = container;
@@ -123,11 +131,11 @@ app.use((req, res, next) => {
 });
 
 // ==========================
-// RATE LIMITER (GLOBAL + PER USER)
+// RATE LIMITER
 // ==========================
 const globalLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 menit
-  max: 500, // maks 500 request per menit dari semua user
+  windowMs: 60 * 1000,
+  max: 500,
   keyGenerator: () => 'global',
   standardHeaders: true
 });
@@ -140,7 +148,7 @@ const webhookLimiter = rateLimit({
 });
 
 // ==========================
-// IDEMPOTENSI (REDIS)
+// IDEMPOTENSI
 // ==========================
 async function isDuplicate(req, ttlSeconds = 120) {
   let id = req.body?.update_id || req.body?.id || req.body?.message_id;
@@ -151,7 +159,7 @@ async function isDuplicate(req, ttlSeconds = 120) {
   const key = `webhook:dup:${req.path}:${id}`;
   const processed = await redisClient.get(key);
   if (processed) return true;
-  await redisClient.setex(key, ttlSeconds, '1');
+  await redisClient.setEx(key, ttlSeconds, '1');
   return false;
 }
 
@@ -177,42 +185,32 @@ function verifyWhatsApp(req, res, next) {
 }
 
 // ==========================
-// QUEUE HANDLER (RESPONSE CEPAT)
+// WEBHOOK HANDLER
 // ==========================
-async function queueHandler(req, res, queue) {
-  // Cek duplikat sebelum masuk queue
+async function handleWebhook(req, res, platform) {
   if (await isDuplicate(req)) {
     logWebhook('debug', 'Duplicate ignored', req);
     return res.status(200).json({ status: 'duplicate' });
   }
 
-  // Ambil hanya field yang diperlukan (hemat memory)
-  const importantFields = ['update_id', 'message', 'sender', 'id', 'message_id', 'callback_query', 'from'];
-  const payload = {};
-  for (const field of importantFields) {
-    if (req.body[field] !== undefined) payload[field] = req.body[field];
-  }
-  // Juga sertakan nested yang umum
-  if (req.body.message?.text) payload.message = { text: req.body.message.text, from: req.body.message.from, chat: req.body.message.chat };
-  if (req.body.sender) payload.sender = req.body.sender;
-  if (req.body.id) payload.id = req.body.id;
+  const payload = {
+    update_id: req.body.update_id,
+    message: req.body.message,
+    sender: req.body.sender,
+    id: req.body.id,
+    message_id: req.body.message_id,
+    callback_query: req.body.callback_query,
+    from: req.body.from
+  };
 
-  // Tambahkan ke queue
-  await queue.add({ payload, requestId: req.id }, {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 1000 }
-  });
-
+  await enqueue(platform, payload, req.id);
   logWebhook('info', 'Queued', req);
   res.status(200).json({ status: 'queued', requestId: req.id });
 }
 
-// ==========================
-// ROUTES
-// ==========================
-app.post('/webhook/telegram', globalLimiter, webhookLimiter, verifyTelegram, (req, res) => queueHandler(req, res, telegramQueue));
-app.post('/webhook/whatsapp', globalLimiter, webhookLimiter, verifyWhatsApp, (req, res) => queueHandler(req, res, whatsappQueue));
-app.post('/webhook/fonnte', globalLimiter, webhookLimiter, verifyWhatsApp, (req, res) => queueHandler(req, res, whatsappQueue));
+app.post('/webhook/telegram', globalLimiter, webhookLimiter, verifyTelegram, (req, res) => handleWebhook(req, res, 'telegram'));
+app.post('/webhook/whatsapp', globalLimiter, webhookLimiter, verifyWhatsApp, (req, res) => handleWebhook(req, res, 'whatsapp'));
+app.post('/webhook/fonnte', globalLimiter, webhookLimiter, verifyWhatsApp, (req, res) => handleWebhook(req, res, 'whatsapp'));
 
 setupWebAPI(app);
 
@@ -220,14 +218,14 @@ setupWebAPI(app);
 // HEALTH CHECK
 // ==========================
 app.get('/health', async (req, res) => {
-  const redisStatus = redisClient.status === 'ready' ? 'up' : 'down';
-  const tgQueueCount = await telegramQueue.count();
-  const waQueueCount = await whatsappQueue.count();
+  const redisStatus = redisClient.isOpen ? 'up' : 'down';
+  const tgQueueLen = await redisClient.lLen(QUEUE_KEYS.telegram).catch(() => 0);
+  const waQueueLen = await redisClient.lLen(QUEUE_KEYS.whatsapp).catch(() => 0);
   res.json({
     status: container.ready ? 'OK' : 'INIT',
     uptime: process.uptime(),
     redis: redisStatus,
-    queues: { telegram: tgQueueCount, whatsapp: waQueueCount },
+    queues: { telegram: tgQueueLen, whatsapp: waQueueLen },
     memory_mb: Math.round(process.memoryUsage().rss / 1024 / 1024)
   });
 });
@@ -235,22 +233,60 @@ app.get('/health', async (req, res) => {
 // ==========================
 // FALLBACK SERVICES
 // ==========================
-function createMemoryCache() { /* sama seperti sebelumnya */ }
-function createDummyDb() { /* sama */ }
+function createMemoryCache() {
+  const store = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of store.entries()) {
+      if (now > entry.expiry) store.delete(key);
+    }
+  }, 60 * 60 * 1000);
+  return {
+    async get(key) {
+      const entry = store.get(key);
+      if (!entry) return null;
+      if (Date.now() > entry.expiry) {
+        store.delete(key);
+        return null;
+      }
+      return entry.value;
+    },
+    async set(key, value, ttl = 3600) {
+      store.set(key, { value, expiry: Date.now() + ttl * 1000 });
+    },
+    async cleanup() {
+      const now = Date.now();
+      for (const [k, v] of store.entries()) {
+        if (now > v.expiry) store.delete(k);
+      }
+    },
+    async quit() { store.clear(); }
+  };
+}
+
+function createDummyDb() {
+  return {
+    from: (table) => ({
+      select: () => ({ eq: () => ({ single: async () => ({ data: null, error: null }) }) }),
+      insert: async (data) => ({ data: null, error: null }),
+      update: async (data) => ({ data: null, error: null }),
+      delete: () => ({ eq: () => ({ error: null }) })
+    })
+  };
+}
 
 async function initServices() {
   try {
-    // Cache: gunakan redisClient langsung, atau memory fallback
-    if (redisClient.status === 'ready') {
+    if (redisClient.isOpen) {
       container.cache = {
         get: async (key) => redisClient.get(key),
-        set: async (key, val, ttl) => redisClient.setex(key, ttl, val),
+        set: async (key, val, ttl) => redisClient.setEx(key, ttl, val),
         cleanup: async () => {},
         quit: async () => redisClient.quit()
       };
       log('info', 'Redis cache ready');
     } else {
-      throw new Error('Redis not ready');
+      throw new Error('Redis not open');
     }
   } catch (err) {
     log('warn', 'Redis fallback to memory', { error: err.message });
@@ -269,6 +305,17 @@ async function initServices() {
 }
 
 // ==========================
+// START WORKER
+// ==========================
+let workerTelegram, workerWhatsapp;
+
+function startWorkers() {
+  workerTelegram = processQueue('telegram', telegramController);
+  workerWhatsapp = processQueue('whatsapp', whatsappController);
+  log('info', 'Queue workers started');
+}
+
+// ==========================
 // CRON & SHUTDOWN
 // ==========================
 let cleanupJob = cron.schedule('0 * * * *', async () => {
@@ -282,10 +329,7 @@ async function shutdown(signal) {
   log('warn', `${signal} received, shutting down`);
 
   cleanupJob.stop();
-  await telegramQueue.close();
-  await whatsappQueue.close();
-  await redisClient.quit();
-
+  if (container.cache?.quit) await container.cache.quit();
   if (server) server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10000);
 }
@@ -299,208 +343,12 @@ process.on('uncaughtException', (err) => {
 });
 
 // ==========================
-// START
+// START SERVER
 // ==========================
 let server;
 async function start() {
   await initServices();
+  startWorkers();
   server = app.listen(PORT, () => log('info', `Server started on port ${PORT}`));
 }
-start();ode-cron');
-
-// Import semua module
-const { initRedis } = require('./modules/cache');
-const { initSupabase } = require('./modules/database');
-const { handleTelegramWebhook } = require('./modules/telegram');
-const { handleWhatsAppWebhook } = require('./modules/whatsapp');  // ✅ WA MODULE
-const { setupWebAPI } = require('./modules/web-api');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// ============================================
-// MIDDLEWARE
-// ============================================
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Logger sederhana untuk debug
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
-
-// ============================================
-// INISIALISASI SERVICE
-// ============================================
-async function init() {
-  try {
-    await initRedis();        // Cache (Redis/Memory)
-    console.log('✅ Redis/Cache initialized');
-  } catch (err) {
-    console.warn('⚠️ Redis init warning:', err.message);
-  }
-  
-  try {
-    initSupabase();           // Database Supabase
-    console.log('✅ Supabase initialized');
-  } catch (err) {
-    console.warn('⚠️ Supabase init warning:', err.message);
-  }
-}
-
-init();
-
-// ============================================
-// WEBHOOK UNTUK TELEGRAM
-// ============================================
-app.post('/webhook/telegram', (req, res) => {
-  console.log('📨 [TELEGRAM] Webhook received');
-  handleTelegramWebhook(req, res);
-});
-
-// ============================================
-// WEBHOOK UNTUK WHATSAPP
-// ============================================
-app.post('/webhook/whatsapp', (req, res) => {
-  console.log('📨 [WHATSAPP] Webhook received');
-  handleWhatsAppWebhook(req, res);
-});
-
-// ============================================
-// WEBHOOK UNTUK WHATSAPP (Fonnte Format Khusus)
-// ============================================
-app.post('/webhook/fonnte', (req, res) => {
-  console.log('📨 [FONNTE] Webhook received');
-  handleWhatsAppWebhook(req, res);
-});
-
-// ============================================
-// SETUP SEMUA API ENDPOINTS
-// (chat, level, health, dll)
-// ============================================
-setupWebAPI(app);
-
-// ============================================
-// ROOT ENDPOINT (Info Server)
-// ============================================
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Yenni - Sahabat AI Anda',
-    version: '3.0.0',
-    status: 'running',
-    platforms: {
-      telegram: process.env.TELEGRAM_BOT_TOKEN ? '✅ Active' : '❌ Not configured',
-      whatsapp: (process.env.FONNTE_API_KEY || process.env.WATI_API_KEY) ? '✅ Active' : '❌ Not configured',
-      web: '✅ Active'
-    },
-    endpoints: {
-      telegram: '/webhook/telegram',
-      whatsapp: '/webhook/whatsapp',
-      fonnte: '/webhook/fonnte',
-      api: '/api/chat',
-      levels: '/api/levels',
-      health: '/health'
-    }
-  });
-});
-
-// ============================================
-// HEALTH CHECK (Untuk Railway & Monitoring)
-// ============================================
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    platforms: {
-      telegram: !!process.env.TELEGRAM_BOT_TOKEN,
-      whatsapp: !!(process.env.FONNTE_API_KEY || process.env.WATI_API_KEY),
-      supabase: true
-    }
-  });
-});
-
-// ============================================
-// PING ENDPOINT (Untuk keep-alive)
-// ============================================
-app.get('/ping', (req, res) => {
-  res.send('pong');
-});
-
-// ============================================
-// ENDPOINT TEST UNTUK WEBHOOK (Debug)
-// ============================================
-app.post('/test/telegram', (req, res) => {
-  console.log('🧪 [TEST] Telegram webhook test:', req.body);
-  res.json({ received: true, body: req.body });
-});
-
-app.post('/test/whatsapp', (req, res) => {
-  console.log('🧪 [TEST] WhatsApp webhook test:', req.body);
-  res.json({ received: true, body: req.body });
-});
-
-// ============================================
-// CLEANUP CRON JOB (Setiap jam)
-// ============================================
-cron.schedule('0 * * * *', async () => {
-  console.log('🧹 Running cleanup cron job...');
-  // Cleanup logic bisa ditambahkan di sini jika perlu
-});
-
-// ============================================
-// START SERVER
-// ============================================
-const server = app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                         🤖 YENNI - SAHABAT AI ANDA 🤖                         ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║                                                                              ║
-║  ✅ Server running on port: ${PORT}                                               ║
-║  ✅ Status: ONLINE                                                            ║
-║                                                                              ║
-║  📱 PLATFORMS:                                                                ║
-║     ├─ Telegram Bot: ${process.env.TELEGRAM_BOT_TOKEN ? '🟢 ACTIVE' : '🔴 INACTIVE (no token)'}        ║
-║     ├─ WhatsApp Bot: ${(process.env.FONNTE_API_KEY || process.env.WATI_API_KEY) ? '🟢 ACTIVE' : '🔴 INACTIVE (no API key)'}        ║
-║     └─ Web API:       🟢 ACTIVE                                              ║
-║                                                                              ║
-║  🔗 ENDPOINTS:                                                                ║
-║     ├─ GET  /              → Info server                                      ║
-║     ├─ GET  /health        → Health check                                    ║
-║     ├─ GET  /ping          → Keep-alive                                      ║
-║     ├─ POST /api/chat      → Chat API                                        ║
-║     ├─ GET  /api/levels    → Daftar level                                    ║
-║     ├─ POST /api/level     → Set level user                                  ║
-║     ├─ POST /webhook/telegram → Telegram webhook                             ║
-║     ├─ POST /webhook/whatsapp → WhatsApp webhook (Fonnte/WATI)               ║
-║     └─ POST /webhook/fonnte   → Fonnte webhook (alternatif)                  ║
-║                                                                              ║
-║  🚀 YENNI SIAP MEMBANTU!                                                      ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-  `);
-});
-
-// ============================================
-// GRACEFUL SHUTDOWN (Penanganan mati server)
-// ============================================
-process.on('SIGTERM', () => {
-  console.log('🛑 SIGTERM received, closing server...');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('🛑 SIGINT received, closing server...');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
-});
-
-module.exports = app;
+start();
