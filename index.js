@@ -47,7 +47,7 @@ function logWebhook(level, message, req, meta = {}) {
 }
 
 // ==========================
-// REDIS CONNECTION
+// REDIS CONNECTION (dengan inisialisasi aman)
 // ==========================
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
@@ -56,32 +56,36 @@ const redisClient = redis.createClient({
 redisClient.on('error', (err) => log('error', 'Redis error', { error: err.message }));
 redisClient.on('connect', () => log('info', 'Redis connected'));
 
-// Koneksi ke Redis (async)
-(async () => {
-  await redisClient.connect();
-})();
+// Fungsi untuk memastikan Redis terhubung sebelum dipakai
+async function ensureRedisConnected() {
+  if (!redisClient.isOpen) {
+    await redisClient.connect();
+  }
+}
 
 // ==========================
-// SIMPLE QUEUE (MANUAL)
+// SIMPLE QUEUE (MANUAL) dengan RETRY & DEAD LETTER
 // ==========================
 const QUEUE_KEYS = {
   telegram: 'queue:telegram',
-  whatsapp: 'queue:whatsapp'
+  whatsapp: 'queue:whatsapp',
+  dead: 'queue:dead'
 };
 
-// Menambahkan job ke antrian
+// Enqueue job
 async function enqueue(platform, payload, requestId) {
   const job = {
     id: `${Date.now()}:${requestId}`,
     payload,
     createdAt: new Date().toISOString(),
-    attempts: 0
+    attempts: 0,
+    maxAttempts: 3
   };
   await redisClient.lPush(QUEUE_KEYS[platform], JSON.stringify(job));
   log('debug', `Enqueued ${platform} job`, { jobId: job.id });
 }
 
-// Worker: proses antrian (jalan terus di background)
+// Worker dengan retry dan dead letter
 async function processQueue(platform, handler) {
   while (true) {
     try {
@@ -91,19 +95,44 @@ async function processQueue(platform, handler) {
         continue;
       }
       const job = JSON.parse(jobStr);
-      log('info', `Processing ${platform} job`, { jobId: job.id });
-      
+      log('info', `Processing ${platform} job`, { jobId: job.id, attempt: job.attempts + 1 });
+
+      // Buat dummy response object agar controller tidak error jika memanggil res.json()
+      const dummyRes = {
+        status: function(code) { this.statusCode = code; return this; },
+        json: function(data) { log('debug', 'Dummy response json called', { data, jobId: job.id }); return this; },
+        send: function(data) { log('debug', 'Dummy response send called', { jobId: job.id }); return this; },
+        headersSent: false
+      };
+
       const fakeReq = {
         body: job.payload,
         id: job.id,
         container: { db: container.db, cache: container.cache },
-        path: `/${platform}`
+        path: `/${platform}`,
+        params: {},
+        query: {}
       };
-      
-      await handler(fakeReq, null);
-      log('info', `Job ${platform} completed`, { jobId: job.id });
+
+      try {
+        await handler(fakeReq, dummyRes);
+        log('info', `Job ${platform} completed`, { jobId: job.id });
+      } catch (handlerErr) {
+        // Retry jika masih ada kesempatan
+        if (job.attempts < job.maxAttempts - 1) {
+          job.attempts++;
+          await redisClient.lPush(QUEUE_KEYS[platform], JSON.stringify(job));
+          log('warn', `Job ${platform} retry`, { jobId: job.id, attemptsLeft: job.maxAttempts - job.attempts });
+        } else {
+          // Kirim ke dead letter queue
+          job.failedAt = new Date().toISOString();
+          job.error = handlerErr.message;
+          await redisClient.lPush(QUEUE_KEYS.dead, JSON.stringify(job));
+          log('error', `Job ${platform} moved to dead letter`, { jobId: job.id, error: handlerErr.message });
+        }
+      }
     } catch (err) {
-      log('error', `Worker error for ${platform}`, { error: err.message });
+      log('error', `Worker loop error for ${platform}`, { error: err.message });
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
@@ -157,9 +186,9 @@ async function isDuplicate(req, ttlSeconds = 120) {
     id = hash;
   }
   const key = `webhook:dup:${req.path}:${id}`;
-  const processed = await redisClient.get(key);
+  const processed = await redisClient.get(key).catch(() => null);
   if (processed) return true;
-  await redisClient.setEx(key, ttlSeconds, '1');
+  await redisClient.setEx(key, ttlSeconds, '1').catch(() => {});
   return false;
 }
 
@@ -185,14 +214,16 @@ function verifyWhatsApp(req, res, next) {
 }
 
 // ==========================
-// WEBHOOK HANDLER
+// WEBHOOK HANDLER (LANGSUNG RESPONSE + ENQUEUE)
 // ==========================
 async function handleWebhook(req, res, platform) {
+  // Cek duplikat
   if (await isDuplicate(req)) {
     logWebhook('debug', 'Duplicate ignored', req);
     return res.status(200).json({ status: 'duplicate' });
   }
 
+  // Ekstrak payload minimal untuk hemat memory
   const payload = {
     update_id: req.body.update_id,
     message: req.body.message,
@@ -221,11 +252,12 @@ app.get('/health', async (req, res) => {
   const redisStatus = redisClient.isOpen ? 'up' : 'down';
   const tgQueueLen = await redisClient.lLen(QUEUE_KEYS.telegram).catch(() => 0);
   const waQueueLen = await redisClient.lLen(QUEUE_KEYS.whatsapp).catch(() => 0);
+  const deadLen = await redisClient.lLen(QUEUE_KEYS.dead).catch(() => 0);
   res.json({
     status: container.ready ? 'OK' : 'INIT',
     uptime: process.uptime(),
     redis: redisStatus,
-    queues: { telegram: tgQueueLen, whatsapp: waQueueLen },
+    queues: { telegram: tgQueueLen, whatsapp: waQueueLen, dead: deadLen },
     memory_mb: Math.round(process.memoryUsage().rss / 1024 / 1024)
   });
 });
@@ -276,7 +308,9 @@ function createDummyDb() {
 }
 
 async function initServices() {
+  // Pastikan Redis terhubung terlebih dahulu
   try {
+    await ensureRedisConnected();
     if (redisClient.isOpen) {
       container.cache = {
         get: async (key) => redisClient.get(key),
@@ -293,6 +327,7 @@ async function initServices() {
     container.cache = createMemoryCache();
   }
 
+  // Inisialisasi database
   try {
     container.db = initSupabase();
     log('info', 'Database ready');
@@ -310,6 +345,7 @@ async function initServices() {
 let workerTelegram, workerWhatsapp;
 
 function startWorkers() {
+  // Jalankan worker sebagai Promise tanpa await (biarkan berjalan di background)
   workerTelegram = processQueue('telegram', telegramController);
   workerWhatsapp = processQueue('whatsapp', whatsappController);
   log('info', 'Queue workers started');
