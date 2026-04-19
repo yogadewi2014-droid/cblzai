@@ -3,50 +3,96 @@ const { createClient: createRedisClient } = require('redis');
 
 let redisClient = null;
 let redisConnected = false;
-const memoryCache = new Map();
+const memoryStore = new Map();
+
+// Cleanup memory cache setiap jam (untuk fallback)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of memoryStore.entries()) {
+    if (now > entry.expiry) memoryStore.delete(key);
+  }
+}, 60 * 60 * 1000);
 
 async function initRedis() {
+  // Jika Redis sudah terkoneksi, kembalikan objek cache yang memakai Redis
+  if (redisClient && redisConnected) {
+    return {
+      get: async (key) => {
+        const data = await redisClient.get(key);
+        return data ? JSON.parse(data) : null;
+      },
+      set: async (key, value, ttl = 3600) => {
+        await redisClient.setEx(key, ttl, JSON.stringify(value));
+      },
+      cleanup: async () => {
+        // Redis tidak perlu cleanup manual
+      },
+      quit: async () => {
+        if (redisClient) await redisClient.quit();
+      }
+    };
+  }
+
+  // Jika tidak ada konfigurasi Redis, langsung pakai memory
   if (!process.env.REDIS_URL) {
     console.log('Redis not configured, using memory cache');
-    return;
+    return createMemoryCache();
   }
+
+  // Coba konek ke Redis
   try {
     redisClient = createRedisClient({ url: process.env.REDIS_URL });
     redisClient.on('error', (err) => console.warn('Redis error:', err.message));
     await redisClient.connect();
     redisConnected = true;
     console.log('Redis connected');
+    return {
+      get: async (key) => {
+        const data = await redisClient.get(key);
+        return data ? JSON.parse(data) : null;
+      },
+      set: async (key, value, ttl = 3600) => {
+        await redisClient.setEx(key, ttl, JSON.stringify(value));
+      },
+      cleanup: async () => {},
+      quit: async () => {
+        if (redisClient) await redisClient.quit();
+      }
+    };
   } catch (err) {
-    console.warn('Redis failed, using memory cache');
-    redisConnected = false;
+    console.warn('Redis failed, using memory cache', err.message);
+    return createMemoryCache();
   }
 }
 
-async function getCache(key) {
-  if (redisConnected && redisClient) {
-    const data = await redisClient.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-  const cached = memoryCache.get(key);
-  if (cached && cached.expiry > Date.now()) return cached.data;
-  return null;
+function createMemoryCache() {
+  return {
+    get: async (key) => {
+      const entry = memoryStore.get(key);
+      if (!entry) return null;
+      if (Date.now() > entry.expiry) {
+        memoryStore.delete(key);
+        return null;
+      }
+      return entry.value;
+    },
+    set: async (key, value, ttl = 3600) => {
+      memoryStore.set(key, {
+        value,
+        expiry: Date.now() + ttl * 1000
+      });
+    },
+    cleanup: async () => {
+      const now = Date.now();
+      for (const [key, entry] of memoryStore.entries()) {
+        if (now > entry.expiry) memoryStore.delete(key);
+      }
+      console.log('Memory cache cleaned');
+    },
+    quit: async () => {
+      memoryStore.clear();
+    }
+  };
 }
 
-async function setCache(key, data, ttlSeconds = 3600) {
-  if (redisConnected && redisClient) {
-    await redisClient.setEx(key, ttlSeconds, JSON.stringify(data));
-  } else {
-    memoryCache.set(key, { data, expiry: Date.now() + (ttlSeconds * 1000) });
-  }
-}
-
-async function setUserSession(userId, platform, level) {
-  await setCache(`session:${userId}:${platform}`, { level, lastActive: Date.now() }, 86400);
-}
-
-async function getUserSession(userId, platform) {
-  const session = await getCache(`session:${userId}:${platform}`);
-  return session ? session.level : null;
-}
-
-module.exports = { initRedis, getCache, setCache, setUserSession, getUserSession, redisConnected };
+module.exports = { initRedis };
