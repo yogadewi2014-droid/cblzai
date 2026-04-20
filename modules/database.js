@@ -1,13 +1,18 @@
 // modules/database.js
 const { createClient } = require('@supabase/supabase-js');
-const { CONFIG } = require('../config');
 
 let supabase = null;
 
 function initSupabase() {
-  if (CONFIG.supabase.url && CONFIG.supabase.key) {
-    supabase = createClient(CONFIG.supabase.url, CONFIG.supabase.key);
-    console.log('Supabase connected');
+  // Ambil dari environment variables Railway
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_ANON_KEY; // atau SUPABASE_SERVICE_ROLE_KEY jika perlu bypass RLS
+
+  if (supabaseUrl && supabaseKey) {
+    supabase = createClient(supabaseUrl, supabaseKey);
+    console.log('✅ Supabase connected');
+  } else {
+    console.warn('⚠️ Supabase credentials not set in environment variables');
   }
   return supabase;
 }
@@ -40,5 +45,8 @@ async function getChatHistory(userId, platform, limit = 10) {
   if (error) return [];
   return (data || []).reverse();
 }
+
+// Inisialisasi segera saat modul dimuat
+initSupabase();
 
 module.exports = { initSupabase, supabase, saveChatMessage, getChatHistory };
