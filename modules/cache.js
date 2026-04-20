@@ -1,46 +1,25 @@
-// ai-cache.js
+// modules/cache.js
 const crypto = require('crypto');
 
 // =========================
-// KONFIGURASI (env)
+// CONFIG
 // =========================
-const MAX_MEMORY_ITEMS = parseInt(process.env.MAX_MEMORY_ITEMS || '2000');    // lebih kecil karena Redis diprioritaskan
-const MAX_VECTOR_ITEMS = parseInt(process.env.MAX_VECTOR_ITEMS || '1500');
-const DEFAULT_TTL = parseInt(process.env.DEFAULT_TTL || '3600');
+const DEFAULT_TTL = parseInt(process.env.CACHE_TTL || '3600'); // detik
+const MAX_ITEMS = parseInt(process.env.CACHE_MAX_ITEMS || '2000');
 const SEMANTIC_THRESHOLD = parseFloat(process.env.SEMANTIC_THRESHOLD || '0.92');
-const CLEANUP_INTERVAL_MS = parseInt(process.env.CLEANUP_INTERVAL_MS || '120000');
-const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
-
-// =========================
-// LOGGER
-// =========================
-const log = (level, message, data = null) => {
-  const levels = { error: 0, warn: 1, info: 2, debug: 3 };
-  if (levels[level] <= levels[LOG_LEVEL]) {
-    const emoji = { error: '❌', warn: '⚠️', info: 'ℹ️', debug: '🔍', hit: '⚡', semantic: '🧠' };
-    console.log(`${emoji[level] || '📦'} [${level.toUpperCase()}] ${message}`, data ? JSON.stringify(data) : '');
-  }
-};
+const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL || '120000');
+const MAX_VECTOR_ITEMS = parseInt(process.env.MAX_VECTOR_ITEMS || '1000');
 
 // =========================
 // UTILS
 // =========================
-function safeParse(data) {
-  try { return JSON.parse(data); } catch { return null; }
-}
-
-function normalizePrompt(text = '') {
+function normalize(text = '') {
   return text.toLowerCase().trim().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
 }
 
-function createCacheKey({ prompt, model }) {
-  const normalized = normalizePrompt(prompt);
-  return crypto.createHash('sha256').update(`${model}:${normalized}`).digest('hex');
-}
-
-function validateEmbedding(embedding) {
-  if (!Array.isArray(embedding) || embedding.length === 0) throw new Error('Invalid embedding');
-  return true;
+function createKey({ prompt, model, intent = 'text' }) {
+  const base = `${intent}:${model}:${normalize(prompt)}`;
+  return crypto.createHash('sha256').update(base).digest('hex');
 }
 
 function cosineSimilarity(a, b) {
@@ -51,245 +30,305 @@ function cosineSimilarity(a, b) {
     magA += a[i] ** 2;
     magB += b[i] ** 2;
   }
-  magA = Math.sqrt(magA);
-  magB = Math.sqrt(magB);
-  return magA && magB ? dot / (magA * magB) : 0;
+  const mag = Math.sqrt(magA) * Math.sqrt(magB);
+  return mag === 0 ? 0 : dot / mag;
 }
 
 // =========================
-// MEMORY CACHE (fallback)
+// MEMORY CACHE (LRU + TTL + SUMMARY)
 // =========================
 class MemoryCache {
-  constructor(maxItems = MAX_MEMORY_ITEMS) {
-    this.cache = new Map();
-    this.maxItems = maxItems;
-    this.interval = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+  constructor(max = MAX_ITEMS) {
+    this.store = new Map();
+    this.max = max;
+    this.hits = 0;
+    this.misses = 0;
+
+    setInterval(() => this.cleanup(), CLEANUP_INTERVAL);
   }
 
   _evictLRU() {
-    if (this.cache.size < this.maxItems) return;
-    let oldestKey = null, oldestTime = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (entry.lastAccessed < oldestTime) {
-        oldestTime = entry.lastAccessed;
-        oldestKey = key;
+    if (this.store.size < this.max) return;
+    let oldestKey = null;
+    let oldestTime = Date.now();
+
+    for (const [k, v] of this.store.entries()) {
+      if (v.lastAccess < oldestTime) {
+        oldestTime = v.lastAccess;
+        oldestKey = k;
       }
     }
-    if (oldestKey) this.cache.delete(oldestKey);
+    if (oldestKey) this.store.delete(oldestKey);
   }
 
-  async get(key) {
-    const entry = this.cache.get(key);
-    if (!entry) return null;
-    if (Date.now() > entry.expiry) {
-      this.cache.delete(key);
+  get(key) {
+    const item = this.store.get(key);
+    if (!item) {
+      this.misses++;
       return null;
     }
-    entry.lastAccessed = Date.now();
-    return entry.value;
+
+    if (Date.now() > item.expiry) {
+      this.store.delete(key);
+      this.misses++;
+      return null;
+    }
+
+    this.hits++;
+    item.lastAccess = Date.now();
+    return item.value;
   }
 
-  async set(key, value, ttl = DEFAULT_TTL) {
+  set(key, value, ttl = DEFAULT_TTL) {
     this._evictLRU();
-    this.cache.set(key, { value, expiry: Date.now() + ttl * 1000, lastAccessed: Date.now() });
+    this.store.set(key, {
+      value,
+      expiry: Date.now() + ttl * 1000,
+      lastAccess: Date.now()
+    });
   }
 
-  async delete(key) { this.cache.delete(key); }
-  async clear() { this.cache.clear(); }
   cleanup() {
     const now = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (now > entry.expiry) this.cache.delete(key);
+    for (const [k, v] of this.store.entries()) {
+      if (now > v.expiry) this.store.delete(k);
     }
   }
-  async quit() { clearInterval(this.interval); this.cache.clear(); }
+
+  stats() {
+    const total = this.hits + this.misses;
+    return {
+      items: this.store.size,
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: total ? (this.hits / total * 100).toFixed(1) : 0
+    };
+  }
+
+  // ========== MEMORY SUMMARY (HEMAT) ==========
+  getMemorySummary() {
+    const now = Date.now();
+    let totalKeyBytes = 0;
+    let totalValueBytes = 0;
+    let validItems = 0;
+
+    for (const [key, entry] of this.store.entries()) {
+      if (now <= entry.expiry) validItems++;
+      totalKeyBytes += Buffer.byteLength(key, 'utf8');
+      // Perkiraan size value: JSON string dari 'value' field
+      const valueStr = JSON.stringify(entry.value);
+      totalValueBytes += Buffer.byteLength(valueStr, 'utf8');
+    }
+    // Overhead per entry: Map + object (estimasi 48 byte)
+    const overheadBytes = this.store.size * 48;
+    const totalBytes = totalKeyBytes + totalValueBytes + overheadBytes;
+
+    return {
+      type: 'MemoryCache',
+      maxItems: this.max,
+      currentItems: this.store.size,
+      validItems,
+      expiredItems: this.store.size - validItems,
+      estimatedMemoryKB: Math.round(totalBytes / 1024),
+      utilizationPercent: Math.round((this.store.size / this.max) * 100),
+      ...this.stats() // sertakan hit/miss
+    };
+  }
 }
 
 // =========================
-// VECTOR STORE (in-memory)
+// VECTOR STORE (SEMANTIC CACHE)
 // =========================
 class VectorStore {
-  constructor(maxItems = MAX_VECTOR_ITEMS) {
+  constructor(max = MAX_VECTOR_ITEMS) {
     this.items = [];
-    this.maxItems = maxItems;
+    this.max = max;
+    this.hits = 0;
+    this.misses = 0;
   }
 
-  async search(queryVector, threshold = SEMANTIC_THRESHOLD) {
+  insert(item) {
+    this.items.push(item);
+    if (this.items.length > this.max) {
+      // Hapus 10% tertua
+      this.items.splice(0, Math.floor(this.max * 0.1));
+    }
+  }
+
+  search(vec, threshold) {
     let best = null;
+
     for (const item of this.items) {
-      const score = cosineSimilarity(queryVector, item.embedding);
+      const score = cosineSimilarity(vec, item.embedding);
       if (score >= threshold && (!best || score > best.score)) {
         best = { ...item, score };
       }
     }
+    if (best) this.hits++;
+    else this.misses++;
     return best;
   }
 
-  async insert(data) {
-    this.items.push(data);
-    if (this.items.length > this.maxItems) {
-      this.items.splice(0, Math.floor(this.maxItems * 0.1));
+  getMemorySummary() {
+    let totalBytes = 0;
+    for (const item of this.items) {
+      // Estimasi embedding (array of floats)
+      totalBytes += Buffer.byteLength(JSON.stringify(item.embedding), 'utf8');
+      totalBytes += Buffer.byteLength(item.prompt || '', 'utf8');
+      totalBytes += Buffer.byteLength(JSON.stringify(item.response), 'utf8');
     }
+    const totalKB = Math.round(totalBytes / 1024);
+    const total = this.hits + this.misses;
+    return {
+      type: 'VectorStore',
+      maxItems: this.max,
+      currentItems: this.items.length,
+      estimatedMemoryKB: totalKB,
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: total ? (this.hits / total * 100).toFixed(1) : 0
+    };
   }
-
-  async clear() { this.items = []; }
-  size() { return this.items.length; }
 }
 
 // =========================
-// REDIS WRAPPER (dengan reconnect & fallback)
-// =========================
-function createRedisWrapper(redisClient) {
-  return {
-    get: async (key) => {
-      const data = await redisClient.get(key);
-      return data ? safeParse(data) : null;
-    },
-    set: async (key, value, ttl = DEFAULT_TTL) => {
-      await redisClient.setEx(key, ttl, JSON.stringify(value));
-    },
-    delete: async (key) => { await redisClient.del(key); },
-    quit: async () => { await redisClient.quit(); },
-  };
-}
-
-// =========================
-// CACHE ORCHESTRATOR
+// MAIN CACHE ORCHESTRATOR
 // =========================
 class AICache {
-  constructor(options) {
-    this.cache = options.cache;           // Redis wrapper atau MemoryCache
-    this.vectorStore = options.vectorStore || new VectorStore();
-    this.embeddingFn = options.embeddingFn || null;
-    this.ttl = options.ttl || DEFAULT_TTL;
-    this.semanticThreshold = options.semanticThreshold || SEMANTIC_THRESHOLD;
-    this.slidingTtl = options.slidingTtl || false;
-  }
+  constructor({
+    embeddingFn = null,
+    ttl = DEFAULT_TTL,
+    semanticThreshold = SEMANTIC_THRESHOLD
+  } = {}) {
+    this.cache = new MemoryCache();
+    this.vector = new VectorStore();
+    this.embeddingFn = embeddingFn;
+    this.ttl = ttl;
+    this.semanticThreshold = semanticThreshold;
 
-  async get(prompt, model, callLLM) {
-    const key = createCacheKey({ prompt, model });
-
-    // L1: Exact cache
-    const exact = await this.cache.get(key);
-    if (exact) {
-      log('hit', `Exact cache hit for ${model}`, { promptPreview: prompt.slice(0, 50) });
-      if (this.slidingTtl) await this.cache.set(key, exact, this.ttl);
-      return exact;
-    }
-
-    // L2: Semantic cache
-    let embedding = null;
-    if (this.embeddingFn) {
-      try {
-        embedding = await this.embeddingFn(prompt);
-        validateEmbedding(embedding);
-        const similar = await this.vectorStore.search(embedding, this.semanticThreshold);
-        if (similar) {
-          log('semantic', 'Semantic cache hit', { score: similar.score, original: similar.prompt.slice(0, 50) });
-          // Simpan ke exact cache untuk next time
-          await this.cache.set(key, similar.response, this.ttl);
-          return similar.response;
-        }
-      } catch (err) {
-        log('warn', 'Embedding error, skip semantic', err.message);
-      }
-    }
-
-    // L3: LLM call
-    log('info', `Cache miss → calling LLM (${model})`);
-    const response = await callLLM(prompt);
-
-    // Simpan ke exact cache
-    await this.cache.set(key, response, this.ttl);
-
-    // Simpan ke vector store jika embedding tersedia
-    if (embedding) {
-      await this.vectorStore.insert({ embedding, response, prompt, model, timestamp: Date.now() });
-    }
-
-    return response;
-  }
-
-  async stats() {
-    let cacheSize = 0;
-    if (this.cache.cache && this.cache.cache instanceof Map) cacheSize = this.cache.cache.size;
-    else if (typeof this.cache.size === 'function') cacheSize = await this.cache.size();
-    return {
-      cacheType: this.cache.constructor.name,
-      vectorSize: this.vectorStore.size(),
-      exactSize: cacheSize,
+    this.stats = {
+      total: 0,
+      exactHits: 0,
+      semanticHits: 0,
+      llmCalls: 0
     };
   }
 
-  async quit() {
-    if (this.cache.quit) await this.cache.quit();
-    await this.vectorStore.clear();
-  }
-}
+  async get({
+    prompt,
+    model,
+    intent = 'text'
+  }, callLLM) {
 
-// =========================
-// INISIALISASI UTAMA (dengan Redis prioritas)
-// =========================
-let globalCacheInstance = null;
+    this.stats.total++;
 
-async function initCache(options = {}) {
-  if (globalCacheInstance) return globalCacheInstance;
+    const key = createKey({ prompt, model, intent });
 
-  const {
-    redisUrl = process.env.REDIS_URL,
-    embeddingFn = null,
-    ttl = DEFAULT_TTL,
-    semanticThreshold = SEMANTIC_THRESHOLD,
-    slidingTtl = false,
-  } = options;
-
-  let cache = null;
-
-  // 1. Coba Redis jika URL ada
-  if (redisUrl) {
-    try {
-      const { createClient } = require('redis');
-      const redisClient = createClient({
-        url: redisUrl,
-        socket: {
-          reconnectStrategy: (retries) => {
-            if (retries > 3) {
-              log('warn', 'Redis reconnect failed after 3 attempts, fallback to memory');
-              return new Error('Stop reconnecting');
-            }
-            return Math.min(retries * 100, 3000);
-          },
-        },
-      });
-
-      redisClient.on('error', (err) => log('warn', 'Redis error', err.message));
-      
-      await redisClient.connect();
-      log('info', '✅ Redis connected, using Redis as primary cache');
-      cache = createRedisWrapper(redisClient);
-    } catch (err) {
-      log('warn', 'Redis connection failed, falling back to memory cache', err.message);
+    // L1 EXACT CACHE
+    const cached = this.cache.get(key);
+    if (cached) {
+      this.stats.exactHits++;
+      return cached;
     }
+
+    // L2 SEMANTIC (hanya untuk text, prompt cukup panjang)
+    if (intent === 'text' && this.embeddingFn && prompt.length > 20) {
+      try {
+        const emb = await this.embeddingFn(prompt);
+        const similar = this.vector.search(emb, this.semanticThreshold);
+        if (similar) {
+          this.stats.semanticHits++;
+          // simpan ke exact cache agar next time langsung hit
+          this.cache.set(key, similar.response, this.ttl);
+          return similar.response;
+        }
+      } catch (e) {
+        // skip silently
+      }
+    }
+
+    // L3 LLM CALL
+    this.stats.llmCalls++;
+    const result = await callLLM();
+
+    // normalisasi response
+    const normalized = {
+      type: 'text',
+      content: result.content || result
+    };
+
+    // cost-aware TTL
+    let finalTtl = this.ttl;
+    if (model === 'gpt5') finalTtl *= 3;
+    if (intent !== 'text') finalTtl = 300;
+
+    this.cache.set(key, normalized, finalTtl);
+
+    // simpan ke vector store jika memungkinkan
+    if (this.embeddingFn && intent === 'text' && prompt.length > 20) {
+      try {
+        const emb = await this.embeddingFn(prompt);
+        this.vector.insert({
+          embedding: emb,
+          response: normalized,
+          prompt,
+          model
+        });
+      } catch {}
+    }
+
+    return normalized;
   }
 
-  // 2. Fallback ke memory cache
-  if (!cache) {
-    log('info', '📦 Using in-memory cache (Railway free safe)');
-    cache = new MemoryCache(MAX_MEMORY_ITEMS);
+  getStats() {
+    const total = this.stats.total;
+    return {
+      ...this.stats,
+      hitRate: total
+        ? ((this.stats.exactHits + this.stats.semanticHits) / total * 100).toFixed(1)
+        : 0,
+      memory: this.cache.stats()
+    };
   }
 
-  const vectorStore = new VectorStore(MAX_VECTOR_ITEMS);
+  // ========== MEMORY SUMMARY LENGKAP ==========
+  async getMemorySummary() {
+    const cacheSummary = this.cache.getMemorySummary();
+    const vectorSummary = this.vector.getMemorySummary();
 
-  globalCacheInstance = new AICache({
-    cache,
-    vectorStore,
-    embeddingFn,
-    ttl,
-    semanticThreshold,
-    slidingTtl,
-  });
+    const totalMemoryKB = (cacheSummary.estimatedMemoryKB || 0) + (vectorSummary.estimatedMemoryKB || 0);
+    const totalRequests = this.stats.total;
+    const totalHits = this.stats.exactHits + this.stats.semanticHits;
 
-  return globalCacheInstance;
+    return {
+      timestamp: new Date().toISOString(),
+      totalEstimatedMemoryKB: totalMemoryKB,
+      totalEstimatedMemoryMB: (totalMemoryKB / 1024).toFixed(2),
+      cache: cacheSummary,
+      vectorStore: vectorSummary,
+      performance: {
+        totalRequests,
+        exactHits: this.stats.exactHits,
+        semanticHits: this.stats.semanticHits,
+        llmCalls: this.stats.llmCalls,
+        effectiveHitRate: totalRequests
+          ? ((totalHits / totalRequests) * 100).toFixed(1)
+          : 0
+      }
+    };
+  }
 }
 
-module.exports = { initCache, AICache, MemoryCache, VectorStore, createCacheKey, cosineSimilarity };
+// =========================
+// EXPORT SINGLETON
+// =========================
+let instance = null;
+
+function initCache(opts = {}) {
+  if (!instance) {
+    instance = new AICache(opts);
+  }
+  return instance;
+}
+
+module.exports = { initCache };
