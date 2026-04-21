@@ -4,7 +4,7 @@ const { Telegraf } = require('telegraf');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
-const { initRedis } = require('./conversation/sessionManager');
+const { initRedis, closeRedis } = require('./conversation/sessionManager');
 const { setupTelegramHandler } = require('./handlers/telegram');
 const { setupWhatsAppHandler } = require('./handlers/whatsapp');
 const { ipLimiter } = require('./middleware/rateLimiter');
@@ -16,18 +16,18 @@ const port = process.env.PORT || 3000;
 // Middleware global
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(ipLimiter); // Rate limiting untuk semua endpoint
+app.use(ipLimiter);
 
 app.get('/health', (req, res) => res.status(200).send('Yenni AI OK'));
 
-// Inisialisasi Redis (Upstash)
-initRedis().catch(err => logger.error('Redis init error:', err));
+// Inisialisasi Redis (sinkron)
+initRedis();
 
 // --- Telegram Bot ---
 if (config.telegramToken) {
   const bot = new Telegraf(config.telegramToken);
   setupTelegramHandler(bot);
-  
+
   if (process.env.NODE_ENV === 'production') {
     const webhookPath = `/telegram-webhook-${config.telegramToken.split(':')[0]}`;
     app.use(bot.webhookCallback(webhookPath));
@@ -59,6 +59,7 @@ if (config.whatsappEnabled) {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM received. Shutting down...');
+  await closeRedis();
   process.exit(0);
 });
 
