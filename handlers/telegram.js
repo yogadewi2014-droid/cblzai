@@ -1,4 +1,3 @@
-const { Telegraf } = require('telegraf');
 const { getSession, saveSession } = require('../conversation/sessionManager');
 const { getUser, createUser, updateUserLevel } = require('../services/supabase');
 const { processMessage } = require('./messageProcessor');
@@ -26,7 +25,7 @@ function setupTelegramHandler(bot) {
     session = session || { level: user.level, subLevel: user.sub_level, history: [] };
     await saveSession(userId, session);
     const levelText = getUserLevelText(user.level, user.sub_level);
-    ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
+    await ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
   });
 
   // Handle text messages
@@ -59,22 +58,29 @@ function setupTelegramHandler(bot) {
       return ctx.reply(`✅ Siap! Kamu terdaftar sebagai siswa ${getUserLevelText(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
     }
 
-    // Proses pesan normal
-    ctx.sendChatAction('typing');
+    // Tampilkan indikator "sedang mengetik"
+    try {
+      await ctx.sendChatAction('typing');
+    } catch (actionErr) {
+      logger.warn('Failed to send typing action:', actionErr);
+    }
+
     try {
       const response = await processMessage(userId, message, session, 'telegram');
-      // Pisahkan jika terlalu panjang untuk Telegram (batas 4096 karakter)
+      
+      // Pisahkan jika terlalu panjang (batas 4096 karakter Telegram)
       if (response.length > 4000) {
-        const chunks = response.match(/[\s\S]{1,4000}/g) || [];
+        // Bagi menjadi beberapa pesan, usahakan tidak memotong kata
+        const chunks = splitMessage(response, 4000);
         for (const chunk of chunks) {
-          await ctx.reply(chunk);
+          await ctx.reply(chunk, { parse_mode: 'Markdown' });
         }
       } else {
         await ctx.reply(response, { parse_mode: 'Markdown' });
       }
     } catch (error) {
       logger.error('Telegram process error:', error);
-      ctx.reply('😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.');
+      await ctx.reply('😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.');
     }
   });
 
@@ -82,15 +88,49 @@ function setupTelegramHandler(bot) {
   bot.on('photo', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const session = await getSession(userId);
-    if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
+    if (!session?.level) {
+      return ctx.reply('Pilih jenjang dulu dengan /start ya.');
+    }
     
-    ctx.sendChatAction('typing');
-    const fileId = ctx.message.photo.pop().file_id;
-    const fileUrl = await ctx.telegram.getFileLink(fileId);
-    const caption = ctx.message.caption || 'Jelaskan gambar ini.';
-    const response = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${caption}`, session, 'telegram');
-    ctx.reply(response);
+    // Tampilkan indikator "mengunggah foto" (atau typing sebagai fallback)
+    try {
+      await ctx.sendChatAction('upload_photo');
+    } catch {
+      await ctx.sendChatAction('typing');
+    }
+
+    try {
+      const fileId = ctx.message.photo.pop().file_id;
+      const fileUrl = await ctx.telegram.getFileLink(fileId);
+      const caption = ctx.message.caption || 'Jelaskan gambar ini.';
+      const response = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${caption}`, session, 'telegram');
+      await ctx.reply(response, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Telegram photo process error:', error);
+      await ctx.reply('😔 Maaf, gambar tidak bisa diproses. Coba kirim ulang atau tanyakan dengan teks ya.');
+    }
   });
+}
+
+/**
+ * Membagi teks panjang menjadi beberapa bagian tanpa memotong di tengah kata jika memungkinkan
+ */
+function splitMessage(text, maxLength) {
+  const chunks = [];
+  let current = '';
+  
+  const words = text.split(' ');
+  for (const word of words) {
+    if ((current + ' ' + word).length > maxLength) {
+      chunks.push(current.trim());
+      current = word;
+    } else {
+      current += (current ? ' ' : '') + word;
+    }
+  }
+  if (current) chunks.push(current.trim());
+  
+  return chunks;
 }
 
 function getUserLevelText(level, subLevel) {
