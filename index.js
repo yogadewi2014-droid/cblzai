@@ -11,6 +11,7 @@ const { ipLimiter } = require('./middleware/rateLimiter');
 const logger = require('./utils/logger');
 
 const app = express();
+app.set('trust proxy', 1);
 const port = process.env.PORT || 3000;
 
 // Middleware global
