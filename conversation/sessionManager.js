@@ -22,7 +22,6 @@ async function getSession(userId) {
         const data = await redis.get(`session:${userId}`);
         if (!data) return null;
         try {
-            // Jika data sudah berupa object, langsung return
             if (typeof data === 'object') return data;
             return JSON.parse(data);
         } catch (e) {
@@ -43,9 +42,8 @@ async function saveSession(userId, sessionData, ttlSeconds = 86400) {
 }
 
 async function closeRedis() {
-    if (redis) {
-        logger.info('Redis connection closed (no-op for REST)');
-    }
+    // Upstash Redis REST API tidak memerlukan quit()
+    logger.info('Redis connection closed (no-op for REST)');
 }
 
 module.exports = {
