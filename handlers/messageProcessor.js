@@ -17,7 +17,7 @@ const config = require('../config');
 async function processMessage(userId, message, session, platform) {
     const originalMessage = message;
 
-    // 1. Rate limit & deduplication
+    // Rate limit & dedup
     const allowed = await userRateLimit(userId);
     if (!allowed) return '⏳ Kakak sudah banyak bertanya. Yuk istirahat sebentar! 😊';
     const isDup = await isDuplicateRequest(userId, message);
@@ -25,7 +25,7 @@ async function processMessage(userId, message, session, platform) {
 
     const subLevel = session.subLevel || (session.level === 'sd-smp' ? 'smp' : 'sma');
 
-    // 2. Cek cache
+    // Cache check
     const exactCached = await getExactMatchCache(message, session.level, subLevel);
     if (exactCached) {
         await saveConversation(userId, 'user', message);
@@ -39,7 +39,7 @@ async function processMessage(userId, message, session, platform) {
         return semanticCached;
     }
 
-    // 3. Deteksi respons singkat terhadap follow-up
+    // Respons singkat follow-up
     if (message.match(/^(mau|ya|lanjut|oke|sip|yes|lanjutkan|boleh)$/i)) {
         const lastAssistantMsg = session.history?.filter(m => m.role === 'assistant').pop();
         if (lastAssistantMsg && (lastAssistantMsg.content.includes('lebih detail') || lastAssistantMsg.content.includes('lanjut'))) {
@@ -47,7 +47,7 @@ async function processMessage(userId, message, session, platform) {
         }
     }
 
-    // 4. Permintaan artikel
+    // Permintaan artikel
     const articleMatch = message.match(/buat(?:kan)?\s+artikel\s+(?:tentang\s+)?(.+)/i);
     if (articleMatch) {
         const topic = articleMatch[1];
@@ -63,7 +63,7 @@ async function processMessage(userId, message, session, platform) {
         return response;
     }
 
-    // 5. OCR
+    // OCR
     let extractedText = '';
     if (message.startsWith('[IMAGE]')) {
         const imageUrl = message.substring(7);
@@ -72,7 +72,7 @@ async function processMessage(userId, message, session, platform) {
         message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${message}`;
     }
 
-    // 6. Search
+    // Search
     const searchMatch = message.match(/cari(?:kan)?\s+(?:tentang\s+)?(.+)/i);
     if (searchMatch) {
         const query = searchMatch[1];
@@ -80,20 +80,33 @@ async function processMessage(userId, message, session, platform) {
         message = `Informasi dari pencarian web:\n${searchSummary}\n\nPertanyaan pengguna: ${message}`;
     }
 
-    // 7. Bangun prompt & konteks
     const systemPrompt = buildSystemPrompt(session);
     const context = await manageContext(userId, session, message);
     const fullPrompt = `${systemPrompt}\n\n${context}\n\nUser: ${message}`;
 
-    // 8. Panggil LLM
+    // === DETEKSI SOAL MATEMATIKA / REASONING UNTUK SD/SMP ===
+    const isMathOrReasoning = /hitung|kpk|fpb|kelipatan|faktor|luas|volume|kecepatan|matematika|soal cerita|jam|menit|detik/i.test(originalMessage);
+
     let response;
     try {
-        if (session.level === 'sd-smp') {
+        if (session.level === 'sd-smp' && isMathOrReasoning) {
+            // Soal hitungan SD/SMP pakai DeepSeek atau fallback GPT
+            try {
+                response = await callDeepSeek(fullPrompt);
+            } catch {
+                response = await callOpenAI(fullPrompt);
+            }
+        } else if (session.level === 'sd-smp') {
             response = await callGemini(fullPrompt);
         } else {
+            // SMA/SMK
             const needsReasoning = /analisis|matematika|hitung|kode|program|soal sulit/i.test(message);
             if (needsReasoning) {
-                response = await callDeepSeek(fullPrompt);
+                try {
+                    response = await callDeepSeek(fullPrompt);
+                } catch {
+                    response = await callOpenAI(fullPrompt);
+                }
             } else {
                 response = await callGemini(fullPrompt);
             }
@@ -103,13 +116,12 @@ async function processMessage(userId, message, session, platform) {
         return '😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.';
     }
 
-    // 9. Hanya cache jika bukan error
+    // Hanya cache jika bukan error
     if (!response.includes('gangguan teknis') && !response.includes('Maaf')) {
         await setExactMatchCache(originalMessage, session.level, subLevel, response);
         await setSemanticCache(originalMessage, session.level, subLevel, response);
     }
 
-    // 10. Simpan history & percakapan
     session.history = session.history || [];
     session.history.push({ role: 'user', content: originalMessage });
     session.history.push({ role: 'assistant', content: response });
@@ -117,7 +129,6 @@ async function processMessage(userId, message, session, platform) {
     await saveConversation(userId, 'user', originalMessage);
     await saveConversation(userId, 'assistant', response);
 
-    // 11. Update kuota token
     const actualTokens = countTokens(fullPrompt + response);
     await checkTokenQuota(userId, actualTokens);
 
