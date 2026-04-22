@@ -4,7 +4,6 @@ const { processMessage } = require('./messageProcessor');
 const logger = require('../utils/logger');
 
 function setupTelegramHandler(bot) {
-  // /start command
   bot.start(async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     let user = await getUser(userId);
@@ -21,21 +20,18 @@ function setupTelegramHandler(bot) {
       );
     }
 
-    // User sudah terdaftar
     session = session || { level: user.level, subLevel: user.sub_level, history: [] };
     await saveSession(userId, session);
     const levelText = getUserLevelText(user.level, user.sub_level);
     await ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
   });
 
-  // Handle text messages
   bot.on('text', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const message = ctx.message.text;
     let session = await getSession(userId);
     let user = await getUser(userId);
 
-    // Jika belum pilih jenjang
     if (!user || !session?.level) {
       const choice = message.trim();
       let level, subLevel;
@@ -58,7 +54,6 @@ function setupTelegramHandler(bot) {
       return ctx.reply(`✅ Siap! Kamu terdaftar sebagai siswa ${getUserLevelText(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
     }
 
-    // Tampilkan indikator "sedang mengetik"
     try {
       await ctx.sendChatAction('typing');
     } catch (actionErr) {
@@ -67,16 +62,15 @@ function setupTelegramHandler(bot) {
 
     try {
       const response = await processMessage(userId, message, session, 'telegram');
-      
-      // Pisahkan jika terlalu panjang (batas 4096 karakter Telegram)
+
+      // Pisahkan jika terlalu panjang
       if (response.length > 4000) {
-        // Bagi menjadi beberapa pesan, usahakan tidak memotong kata
         const chunks = splitMessage(response, 4000);
         for (const chunk of chunks) {
-          await ctx.reply(chunk, { parse_mode: 'Markdown' });
+          await ctx.reply(chunk, { parse_mode: 'HTML' });
         }
       } else {
-        await ctx.reply(response, { parse_mode: 'Markdown' });
+        await ctx.reply(response, { parse_mode: 'HTML' });
       }
     } catch (error) {
       logger.error('Telegram process error:', error);
@@ -84,15 +78,13 @@ function setupTelegramHandler(bot) {
     }
   });
 
-  // Handle photo (OCR)
   bot.on('photo', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const session = await getSession(userId);
     if (!session?.level) {
       return ctx.reply('Pilih jenjang dulu dengan /start ya.');
     }
-    
-    // Tampilkan indikator "mengunggah foto" (atau typing sebagai fallback)
+
     try {
       await ctx.sendChatAction('upload_photo');
     } catch {
@@ -104,21 +96,17 @@ function setupTelegramHandler(bot) {
       const fileUrl = await ctx.telegram.getFileLink(fileId);
       const caption = ctx.message.caption || 'Jelaskan gambar ini.';
       const response = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${caption}`, session, 'telegram');
-      await ctx.reply(response, { parse_mode: 'Markdown' });
+      await ctx.reply(response, { parse_mode: 'HTML' });
     } catch (error) {
       logger.error('Telegram photo process error:', error);
-      await ctx.reply('😔 Maaf, gambar tidak bisa diproses. Coba kirim ulang atau tanyakan dengan teks ya.');
+      await ctx.reply('😔 Maaf, gambar tidak bisa diproses. Coba kirim ulang ya.');
     }
   });
 }
 
-/**
- * Membagi teks panjang menjadi beberapa bagian tanpa memotong di tengah kata jika memungkinkan
- */
 function splitMessage(text, maxLength) {
   const chunks = [];
   let current = '';
-  
   const words = text.split(' ');
   for (const word of words) {
     if ((current + ' ' + word).length > maxLength) {
@@ -129,7 +117,6 @@ function splitMessage(text, maxLength) {
     }
   }
   if (current) chunks.push(current.trim());
-  
   return chunks;
 }
 
