@@ -29,13 +29,15 @@ async function getExactMatchCache(question, level, subLevel) {
     const cached = await redis.get(`exact:${hash}`);
     if (cached) {
         logger.info('Exact cache HIT');
-        return JSON.parse(cached);
+        return (typeof cached === 'object') ? cached : JSON.parse(cached);
     }
     return null;
 }
 
 async function setExactMatchCache(question, level, subLevel, response) {
     if (!redis) return;
+    // Jangan simpan error
+    if (response.includes('gangguan teknis') || response.includes('Maaf')) return;
     const hash = crypto.createHash('md5').update(`${question}|${level}|${subLevel}`).digest('hex');
     await redis.set(`exact:${hash}`, JSON.stringify(response), { ex: config.cacheTTL.exactMatch });
 }
@@ -47,20 +49,17 @@ async function getSemanticCache(question, level, subLevel) {
         const emb = await generateEmbedding(question);
         if (!emb) return null;
 
-        // Untuk efisiensi, kita bisa simpan embedding di Redis dengan key pattern tertentu
-        // Di sini kita ambil semua kunci semantic untuk jenjang ini (perhatikan: untuk produksi skala besar gunakan Redis Search)
         const pattern = `semantic:${level}:${subLevel}:*`;
         const keys = await redis.keys(pattern);
-        
         let bestMatch = null;
         let highestSimilarity = 0;
 
         for (const key of keys) {
             const data = await redis.get(key);
             if (!data) continue;
-            const cached = JSON.parse(data);
+            const cached = (typeof data === 'object') ? data : JSON.parse(data);
             if (!cached.embedding) continue;
-            
+
             const similarity = cosineSimilarity(emb, cached.embedding);
             if (similarity > config.semanticSimilarityThreshold && similarity > highestSimilarity) {
                 highestSimilarity = similarity;
@@ -80,23 +79,20 @@ async function getSemanticCache(question, level, subLevel) {
 
 async function setSemanticCache(question, level, subLevel, response) {
     if (!redis) return;
+    if (response.includes('gangguan teknis') || response.includes('Maaf')) return;
     try {
         const emb = await generateEmbedding(question);
         if (!emb) return;
-        
+
         const hash = crypto.createHash('md5').update(`${question}|${level}|${subLevel}`).digest('hex');
         const key = `semantic:${level}:${subLevel}:${hash}`;
-        await redis.set(key, JSON.stringify({ 
-            question, 
-            response, 
-            embedding: emb 
-        }), { ex: config.cacheTTL.semantic });
+        await redis.set(key, JSON.stringify({ question, response, embedding: emb }), { ex: config.cacheTTL.semantic });
     } catch (err) {
         logger.error('Failed to set semantic cache:', err);
     }
 }
 
-// ==================== OCR CACHE (opsional) ====================
+// ==================== OCR CACHE ====================
 async function getCachedOCR(imageHash) {
     if (!redis) return null;
     return await redis.get(`ocr:${imageHash}`);
@@ -108,16 +104,12 @@ async function setCachedOCR(imageHash, text) {
 }
 
 module.exports = {
-    // Search
     getCachedSearchResult,
     cacheSearchResult,
-    // Exact
     getExactMatchCache,
     setExactMatchCache,
-    // Semantic
     getSemanticCache,
     setSemanticCache,
-    // OCR
     getCachedOCR,
     setCachedOCR
 };
