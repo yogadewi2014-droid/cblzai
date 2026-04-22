@@ -2,14 +2,12 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { Redis } = require('@upstash/redis');
 const config = require('../config');
-const logger = require('../utils/logger');
 
 let redis;
 if (config.upstashRedisUrl && config.upstashRedisToken) {
     redis = new Redis({ url: config.upstashRedisUrl, token: config.upstashRedisToken });
 }
 
-// IP-based limiter
 const ipLimiter = rateLimit({
     windowMs: config.rateLimit.ip.windowMs,
     max: config.rateLimit.ip.max,
@@ -18,7 +16,6 @@ const ipLimiter = rateLimit({
     skipFailedRequests: true,
 });
 
-// User-based rate limit
 async function userRateLimit(userId) {
     if (!redis) return true;
     const key = `rate:user:${userId}`;
@@ -29,7 +26,6 @@ async function userRateLimit(userId) {
     return current <= config.rateLimit.user.max;
 }
 
-// Token quota harian
 async function checkTokenQuota(userId, tokensToAdd) {
     if (!redis) return true;
     const today = new Date().toISOString().slice(0, 10);
@@ -43,7 +39,6 @@ async function checkTokenQuota(userId, tokensToAdd) {
     return true;
 }
 
-// Deduplication per user
 async function isDuplicateRequest(userId, message) {
     if (!redis) return false;
     const hash = crypto.createHash('md5').update(message).digest('hex').slice(0, 12);
