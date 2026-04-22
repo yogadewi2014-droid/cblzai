@@ -1,27 +1,25 @@
-const axios = require('axios');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const config = require('../config');
 const logger = require('../utils/logger');
 
-// Menggunakan model ringan dari Hugging Face Inference API (gratis tier)
-const HF_API_URL = 'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2';
-const HF_TOKEN = process.env.HUGGINGFACE_TOKEN || null;
+// Gunakan API key yang sama dengan Gemini
+const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
 /**
- * Menghasilkan vektor embedding dari teks
+ * Menghasilkan embedding vector dari teks menggunakan model embedding Google
+ * Model: 'embedding-001' (gratis, 1.500 request per menit, input hingga 2.048 token)
  */
 async function generateEmbedding(text) {
-    if (!HF_TOKEN) {
-        logger.warn('No Hugging Face token, semantic cache disabled');
+    if (!config.geminiApiKey) {
+        logger.warn('No Gemini API key, semantic cache disabled');
         return null;
     }
     try {
-        const response = await axios.post(HF_API_URL, 
-            { inputs: text, options: { wait_for_model: true } },
-            { headers: { Authorization: `Bearer ${HF_TOKEN}` } }
-        );
-        return response.data; // array of floats
+        const model = genAI.getGenerativeModel({ model: 'embedding-001' });
+        const result = await model.embedContent(text);
+        return result.embedding.values; // array of floats
     } catch (error) {
-        logger.error('Embedding generation error:', error.message);
+        logger.error('Google Embedding error:', error.message);
         return null;
     }
 }
@@ -34,7 +32,7 @@ function cosineSimilarity(vecA, vecB) {
     let dot = 0, normA = 0, normB = 0;
     for (let i = 0; i < vecA.length; i++) {
         dot += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
+        normA += vecA[i] * vecB[i];
         normB += vecB[i] * vecB[i];
     }
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
