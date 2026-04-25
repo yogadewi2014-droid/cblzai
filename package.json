@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "nodemon index.js"
   },
   "keywords": [
     "chatbot",
@@ -31,25 +30,17 @@
     "express": "^4.19.0",
     "express-rate-limit": "^7.4.0",
     "openai": "^4.72.0",
+    "pdf-parse": "^1.1.1",
     "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.33.0",
     "telegraf": "^4.16.0",
     "whatsapp-web.js": "^1.26.0",
     "winston": "^3.15.0"
-    "sharp": "^0.33.0",
-    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
   },
   "engines": {
-    "node": ">=20.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/username/yenni-ai-assistant.git"
-  },
-  "bugs": {
-    "url": "https://github.com/username/yenni-ai-assistant/issues"
-  },
-  "homepage": "https://github.com/username/yenni-ai-assistant#readme"
+    "node": ">=18.0.0"
+  }
 }
