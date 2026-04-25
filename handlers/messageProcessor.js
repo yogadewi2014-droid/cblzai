@@ -4,6 +4,7 @@ const { callDeepSeek } = require('../services/deepseek');
 const { searchAndSummarize } = require('../services/serper');
 const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
+const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor');
 const { manageContext } = require('../conversation/contextCache');
 const { saveSession } = require('../conversation/sessionManager');
 const { saveConversation } = require('../services/supabase');
@@ -15,7 +16,16 @@ const { countTokens } = require('../utils/tokenCounter');
 const logger = require('../utils/logger');
 const config = require('../config');
 
-async function processMessage(userId, message, session, platform) {
+/**
+ * Proses pesan dari pengguna
+ * @param {string} userId - ID pengguna
+ * @param {string} message - Isi pesan
+ * @param {object} session - Data sesi pengguna
+ * @param {string} platform - 'telegram' atau 'whatsapp'
+ * @param {Buffer} [imageBuffer] - Buffer gambar (opsional, untuk WhatsApp)
+ * @returns {Promise<{text: string, images: string[]}>}
+ */
+async function processMessage(userId, message, session, platform, imageBuffer = null) {
     const originalMessage = message;
 
     // Rate limit & deduplikasi
@@ -44,7 +54,7 @@ async function processMessage(userId, message, session, platform) {
     if (message.match(/^(mau|ya|lanjut|oke|sip|yes|lanjutkan|boleh)$/i)) {
         const lastAssistantMsg = session.history?.filter(m => m.role === 'assistant').pop();
         if (lastAssistantMsg && (lastAssistantMsg.content.includes('lebih detail') || lastAssistantMsg.content.includes('lanjut'))) {
-            message = `[User setuju untuk penjelasan lebih lanjut tentang materi sebelumnya]`;
+            message = '[User setuju untuk penjelasan lebih lanjut tentang materi sebelumnya]';
         }
     }
 
@@ -64,10 +74,14 @@ async function processMessage(userId, message, session, platform) {
         return { text: articleResponse, images: [] };
     }
 
-    // OCR (gambar)
+    // ==================== OCR (Gambar dari URL - Telegram) ====================
     let extractedText = '';
-    if (message.startsWith('[IMAGE]')) {
-        const imageUrl = message.substring(7);
+    if (message.startsWith('[IMAGE]') && !message.startsWith('[IMAGE_BUFFER]')) {
+        const imagePart = message.substring(7);
+        const newlineIndex = imagePart.indexOf('\n');
+        const imageUrl = newlineIndex > -1 ? imagePart.substring(0, newlineIndex).trim() : imagePart.trim();
+        const caption = newlineIndex > -1 ? imagePart.substring(newlineIndex + 1).trim() : '';
+
         let buffer;
         try {
             buffer = await downloadFile(imageUrl);
@@ -75,16 +89,92 @@ async function processMessage(userId, message, session, platform) {
             logger.error('Download image failed:', downloadError);
             throw new Error('DOWNLOAD_FAILED: ' + downloadError.message);
         }
+
+        try {
+            buffer = await compressImage(buffer, { maxWidth: 1024, quality: 80 });
+        } catch (compressError) {
+            logger.warn('Compression failed, using original:', compressError);
+        }
+
         try {
             extractedText = await extractTextFromImage(buffer);
         } catch (ocrError) {
             logger.error('OCR failed:', ocrError);
             throw new Error('OCR_FAILED: ' + ocrError.message);
         }
-        message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${message}`;
+        message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan gambar ini.'}`;
     }
 
-    // Search
+    // ==================== OCR dari Buffer (WhatsApp) ====================
+    if (message.startsWith('[IMAGE_BUFFER]')) {
+        const caption = message.substring(13).trim() || 'Jelaskan gambar ini.';
+        if (!imageBuffer) throw new Error('No image buffer provided');
+
+        let compressedBuffer;
+        try {
+            compressedBuffer = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 });
+        } catch (compressError) {
+            logger.warn('Compression failed, using original:', compressError);
+            compressedBuffer = imageBuffer;
+        }
+
+        try {
+            extractedText = await extractTextFromImage(compressedBuffer);
+        } catch (ocrError) {
+            logger.error('OCR failed:', ocrError);
+            throw new Error('OCR_FAILED: ' + ocrError.message);
+        }
+        message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption}`;
+    }
+
+    // ==================== PDF (Telegram) ====================
+    if (message.startsWith('[PDF]')) {
+        const pdfPart = message.substring(5);
+        const newlineIndex = pdfPart.indexOf('\n');
+        const pdfUrl = newlineIndex > -1 ? pdfPart.substring(0, newlineIndex).trim() : pdfPart.trim();
+        const caption = newlineIndex > -1 ? pdfPart.substring(newlineIndex + 1).trim() : '';
+
+        let pdfBuffer;
+        try {
+            pdfBuffer = await downloadFile(pdfUrl);
+        } catch (downloadError) {
+            logger.error('Download PDF failed:', downloadError);
+            throw new Error('DOWNLOAD_FAILED: ' + downloadError.message);
+        }
+
+        let pdfText;
+        try {
+            pdfText = await extractTextFromPDF(pdfBuffer);
+        } catch (pdfError) {
+            logger.error('PDF extraction failed:', pdfError);
+            throw new Error('PDF_EXTRACT_FAILED: ' + pdfError.message);
+        }
+
+        if (!pdfText || pdfText.trim().length === 0) {
+            return {
+                text: '📄 PDF ini sepertinya hasil scan (gambar). Untuk saat ini, Yenni belum bisa membaca tulisan di PDF scan. Kakak bisa kirim fotonya langsung sebagai gambar ya. 😊',
+                images: []
+            };
+        }
+
+        message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan isi PDF ini.'}`;
+    }
+
+    // ==================== PDF Teks (WhatsApp) ====================
+    if (message.startsWith('[PDF_TEXT]')) {
+        const pdfPart = message.substring(9);
+        const newlineIndex = pdfPart.indexOf('\n');
+        const caption = newlineIndex > -1 ? pdfPart.substring(0, newlineIndex).trim() : 'Jelaskan isi PDF ini.';
+        const pdfText = newlineIndex > -1 ? pdfPart.substring(newlineIndex + 1).trim() : pdfPart.trim();
+
+        if (!pdfText || pdfText.trim().length === 0) {
+            return { text: '📄 Tidak ada teks yang ditemukan di PDF ini.', images: [] };
+        }
+
+        message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption}`;
+    }
+
+    // ==================== Search ====================
     const searchMatch = message.match(/cari(?:kan)?\s+(?:tentang\s+)?(.+)/i);
     if (searchMatch) {
         const query = searchMatch[1];
@@ -97,7 +187,7 @@ async function processMessage(userId, message, session, platform) {
     const fullPrompt = `${systemPrompt}\n\n${context}\n\nUser: ${message}`;
 
     // Deteksi soal matematika/reasoning
-    const isMathOrReasoning = /hitung|kpk|fpb|kelipatan|faktor|luas|volume|kecepatan|matematika|soal cerita|jam|menit|detik/i.test(originalMessage);
+    const isMathOrReasoning = /hitung|kpk|fpb|kelipatan|faktor|luas|volume|kecepatan|matematika|soal cerita|jam|menit|detik|grafik|fungsi|turunan|integral|aljabar/i.test(originalMessage);
 
     let response;
     try {
@@ -143,7 +233,7 @@ async function processMessage(userId, message, session, platform) {
             }
             if (imageUrl) {
                 images.push(imageUrl);
-                responseText = responseText.replace(vizRegex, '📊 Lihat gambar visualisasi di bawah ini.');
+                responseText = responseText.replace(vizRegex, '📊 *Lihat gambar visualisasi di bawah ini.*');
             }
         } catch (err) {
             logger.error('Failed to parse visualization block:', err);
