@@ -4,6 +4,7 @@ const { processMessage } = require('./messageProcessor');
 const logger = require('../utils/logger');
 
 function setupTelegramHandler(bot) {
+  // ==================== /START COMMAND ====================
   bot.start(async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     let user = await getUser(userId);
@@ -26,12 +27,14 @@ function setupTelegramHandler(bot) {
     await ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
   });
 
+  // ==================== HANDLE TEXT MESSAGES ====================
   bot.on('text', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const message = ctx.message.text;
     let session = await getSession(userId);
     let user = await getUser(userId);
 
+    // Jika belum pilih jenjang
     if (!user || !session?.level) {
       const choice = message.trim();
       let level, subLevel;
@@ -54,6 +57,7 @@ function setupTelegramHandler(bot) {
       return ctx.reply(`✅ Siap! Kamu terdaftar sebagai siswa ${getUserLevelText(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
     }
 
+    // Tampilkan indikator mengetik
     try {
       await ctx.sendChatAction('typing');
     } catch (actionErr) {
@@ -63,7 +67,7 @@ function setupTelegramHandler(bot) {
     try {
       const result = await processMessage(userId, message, session, 'telegram');
 
-      // Kirim teks (potong jika panjang)
+      // Kirim teks (split jika terlalu panjang)
       if (result.text.length > 4000) {
         const chunks = splitMessage(result.text, 4000);
         for (const chunk of chunks) {
@@ -75,7 +79,12 @@ function setupTelegramHandler(bot) {
 
       // Kirim gambar visualisasi
       for (const imageUrl of result.images) {
-        await ctx.replyWithPhoto(imageUrl);
+        try {
+          await ctx.replyWithPhoto(imageUrl);
+        } catch (imgErr) {
+          logger.error('Failed to send visualization image:', imgErr);
+          await ctx.reply('📊 Maaf, gambar visualisasi gagal dikirim.');
+        }
       }
     } catch (error) {
       logger.error('Telegram process error:', error);
@@ -83,7 +92,7 @@ function setupTelegramHandler(bot) {
     }
   });
 
-  // Handle foto (OCR)
+  // ==================== HANDLE PHOTO (OCR) ====================
   bot.on('photo', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const session = await getSession(userId);
@@ -103,14 +112,18 @@ function setupTelegramHandler(bot) {
       const fileUrl = await ctx.telegram.getFileLink(fileId);
       if (!fileUrl || !fileUrl.href) throw new Error('Invalid file URL');
 
+      // Bersihkan URL dari karakter aneh (newline, spasi, dll)
+      const cleanUrl = fileUrl.href.split('\n')[0].trim();
+      
       const caption = ctx.message.caption || 'Jelaskan gambar ini.';
-      const escapedCaption = caption.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const escapedCaption = escapeHtml(caption);
 
-      logger.info(`Processing image for user ${userId}, url: ${fileUrl.href}`);
+      logger.info(`Processing image for user ${userId}, url: ${cleanUrl}`);
 
-      const result = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${escapedCaption}`, session, 'telegram');
+      const result = await processMessage(userId, `[IMAGE]${cleanUrl}\n${escapedCaption}`, session, 'telegram');
 
-      const safeText = result.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      // Kirim teks (sudah aman HTML)
+      const safeText = escapeHtml(result.text);
       if (safeText.length > 4000) {
         const chunks = splitMessage(safeText, 4000);
         for (const chunk of chunks) {
@@ -120,13 +133,19 @@ function setupTelegramHandler(bot) {
         await ctx.reply(safeText, { parse_mode: 'HTML' });
       }
 
+      // Kirim gambar visualisasi
       for (const imageUrl of result.images) {
-        await ctx.replyWithPhoto(imageUrl);
+        try {
+          await ctx.replyWithPhoto(imageUrl);
+        } catch (imgErr) {
+          logger.error('Failed to send visualization image:', imgErr);
+          await ctx.reply('📊 Maaf, gambar visualisasi gagal dikirim.');
+        }
       }
     } catch (error) {
       logger.error('Telegram photo process error:', { message: error.message, stack: error.stack });
       let userMessage = '😔 Maaf, gambar tidak bisa diproses. ';
-      if (error.message.includes('DOWNLOAD_FAILED')) {
+      if (error.message.includes('DOWNLOAD_FAILED') || error.message.includes('404')) {
         userMessage += 'Gagal mengunduh gambar. Coba kirim ulang ya.';
       } else if (error.message.includes('OCR_FAILED')) {
         userMessage += 'Tulisan di gambar kurang jelas, bisa difoto lebih dekat?';
@@ -136,7 +155,78 @@ function setupTelegramHandler(bot) {
       await ctx.reply(userMessage);
     }
   });
+
+  // ==================== HANDLE DOCUMENT (PDF) ====================
+  bot.on('document', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const session = await getSession(userId);
+    if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
+
+    const doc = ctx.message.document;
+    const fileName = doc.file_name || '';
+
+    // Hanya proses PDF
+    if (!fileName.toLowerCase().endsWith('.pdf')) {
+      return ctx.reply('📎 Untuk saat ini Yenni hanya bisa membaca file PDF. Kirim sebagai gambar kalau mau tanya soal ya.');
+    }
+
+    try {
+      await ctx.sendChatAction('upload_document');
+    } catch {
+      await ctx.sendChatAction('typing');
+    }
+
+    try {
+      const fileId = doc.file_id;
+      const fileUrl = await ctx.telegram.getFileLink(fileId);
+      if (!fileUrl || !fileUrl.href) throw new Error('Invalid file URL');
+
+      // Bersihkan URL
+      const cleanUrl = fileUrl.href.split('\n')[0].trim();
+      
+      const caption = ctx.message.caption || 'Jelaskan isi PDF ini.';
+      const escapedCaption = escapeHtml(caption);
+
+      logger.info(`Processing PDF for user ${userId}, url: ${cleanUrl}`);
+
+      const result = await processMessage(userId, `[PDF]${cleanUrl}\n${escapedCaption}`, session, 'telegram');
+
+      // Kirim teks
+      const safeText = escapeHtml(result.text);
+      if (safeText.length > 4000) {
+        const chunks = splitMessage(safeText, 4000);
+        for (const chunk of chunks) {
+          await ctx.reply(chunk, { parse_mode: 'HTML' });
+        }
+      } else {
+        await ctx.reply(safeText, { parse_mode: 'HTML' });
+      }
+
+      // Kirim gambar visualisasi
+      for (const imageUrl of result.images) {
+        try {
+          await ctx.replyWithPhoto(imageUrl);
+        } catch (imgErr) {
+          logger.error('Failed to send visualization image:', imgErr);
+          await ctx.reply('📊 Maaf, gambar visualisasi gagal dikirim.');
+        }
+      }
+    } catch (error) {
+      logger.error('PDF process error:', { message: error.message, stack: error.stack });
+      let userMessage = '😔 Maaf, file PDF tidak bisa diproses. ';
+      if (error.message.includes('DOWNLOAD_FAILED')) {
+        userMessage += 'Gagal mengunduh file. Coba kirim ulang ya.';
+      } else if (error.message.includes('PDF_EXTRACT_FAILED')) {
+        userMessage += 'Gagal membaca teks dari PDF. Pastikan PDF-nya bukan hasil scan.';
+      } else {
+        userMessage += 'Coba lagi nanti ya.';
+      }
+      await ctx.reply(userMessage);
+    }
+  });
 }
+
+// ==================== HELPER FUNCTIONS ====================
 
 function splitMessage(text, maxLength) {
   const chunks = [];
@@ -152,6 +242,15 @@ function splitMessage(text, maxLength) {
   }
   if (current) chunks.push(current.trim());
   return chunks;
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 function getUserLevelText(level, subLevel) {
