@@ -10,6 +10,7 @@ const { saveConversation } = require('../services/supabase');
 const { buildSystemPrompt, buildArticlePrompt } = require('../services/promptBuilder');
 const { getExactMatchCache, setExactMatchCache, getSemanticCache, setSemanticCache } = require('../middleware/cacheHandler');
 const { userRateLimit, checkTokenQuota, isDuplicateRequest } = require('../middleware/rateLimiter');
+const { generateLatexUrl, generateChartUrl } = require('../services/visualization');
 const { countTokens } = require('../utils/tokenCounter');
 const logger = require('../utils/logger');
 const config = require('../config');
@@ -17,26 +18,26 @@ const config = require('../config');
 async function processMessage(userId, message, session, platform) {
     const originalMessage = message;
 
-    // Rate limit & dedup
+    // Rate limit & deduplikasi
     const allowed = await userRateLimit(userId);
-    if (!allowed) return '⏳ Kakak sudah banyak bertanya. Yuk istirahat sebentar! 😊';
+    if (!allowed) return { text: '⏳ Kakak sudah banyak bertanya. Yuk istirahat sebentar! 😊', images: [] };
     const isDup = await isDuplicateRequest(userId, message);
-    if (isDup) return '🐢 Kakak sudah kirim pertanyaan yang sama. Yenni sedang memproses...';
+    if (isDup) return { text: '🐢 Kakak sudah kirim pertanyaan yang sama. Yenni sedang memproses...', images: [] };
 
     const subLevel = session.subLevel || (session.level === 'sd-smp' ? 'smp' : 'sma');
 
-    // Cache check
+    // Cek cache
     const exactCached = await getExactMatchCache(message, session.level, subLevel);
     if (exactCached) {
         await saveConversation(userId, 'user', message);
         await saveConversation(userId, 'assistant', exactCached);
-        return exactCached;
+        return { text: exactCached, images: [] };
     }
     const semanticCached = await getSemanticCache(message, session.level, subLevel);
     if (semanticCached) {
         await saveConversation(userId, 'user', message);
         await saveConversation(userId, 'assistant', semanticCached);
-        return semanticCached;
+        return { text: semanticCached, images: [] };
     }
 
     // Respons singkat follow-up
@@ -52,23 +53,34 @@ async function processMessage(userId, message, session, platform) {
     if (articleMatch) {
         const topic = articleMatch[1];
         const articlePrompt = buildArticlePrompt(topic, session);
-        const response = await callOpenAI(articlePrompt, { max_tokens: config.wordLimits[subLevel].article * 2 });
-        await setExactMatchCache(originalMessage, session.level, subLevel, response);
-        await setSemanticCache(originalMessage, session.level, subLevel, response);
+        const articleResponse = await callOpenAI(articlePrompt, { max_tokens: config.wordLimits[subLevel].article * 2 });
+        await setExactMatchCache(originalMessage, session.level, subLevel, articleResponse);
+        await setSemanticCache(originalMessage, session.level, subLevel, articleResponse);
         await saveConversation(userId, 'user', originalMessage);
-        await saveConversation(userId, 'assistant', response);
+        await saveConversation(userId, 'assistant', articleResponse);
         session.history.push({ role: 'user', content: originalMessage });
-        session.history.push({ role: 'assistant', content: response });
+        session.history.push({ role: 'assistant', content: articleResponse });
         await saveSession(userId, session);
-        return response;
+        return { text: articleResponse, images: [] };
     }
 
-    // OCR
+    // OCR (gambar)
     let extractedText = '';
     if (message.startsWith('[IMAGE]')) {
         const imageUrl = message.substring(7);
-        const buffer = await downloadFile(imageUrl);
-        extractedText = await extractTextFromImage(buffer);
+        let buffer;
+        try {
+            buffer = await downloadFile(imageUrl);
+        } catch (downloadError) {
+            logger.error('Download image failed:', downloadError);
+            throw new Error('DOWNLOAD_FAILED: ' + downloadError.message);
+        }
+        try {
+            extractedText = await extractTextFromImage(buffer);
+        } catch (ocrError) {
+            logger.error('OCR failed:', ocrError);
+            throw new Error('OCR_FAILED: ' + ocrError.message);
+        }
         message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${message}`;
     }
 
@@ -84,13 +96,12 @@ async function processMessage(userId, message, session, platform) {
     const context = await manageContext(userId, session, message);
     const fullPrompt = `${systemPrompt}\n\n${context}\n\nUser: ${message}`;
 
-    // === DETEKSI SOAL MATEMATIKA / REASONING UNTUK SD/SMP ===
+    // Deteksi soal matematika/reasoning
     const isMathOrReasoning = /hitung|kpk|fpb|kelipatan|faktor|luas|volume|kecepatan|matematika|soal cerita|jam|menit|detik/i.test(originalMessage);
 
     let response;
     try {
         if (session.level === 'sd-smp' && isMathOrReasoning) {
-            // Soal hitungan SD/SMP pakai DeepSeek atau fallback GPT
             try {
                 response = await callDeepSeek(fullPrompt);
             } catch {
@@ -99,7 +110,6 @@ async function processMessage(userId, message, session, platform) {
         } else if (session.level === 'sd-smp') {
             response = await callGemini(fullPrompt);
         } else {
-            // SMA/SMK
             const needsReasoning = /analisis|matematika|hitung|kode|program|soal sulit/i.test(message);
             if (needsReasoning) {
                 try {
@@ -113,26 +123,52 @@ async function processMessage(userId, message, session, platform) {
         }
     } catch (error) {
         logger.error('LLM error:', error);
-        return '😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.';
+        return { text: '😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.', images: [] };
     }
 
-    // Hanya cache jika bukan error
-    if (!response.includes('gangguan teknis') && !response.includes('Maaf')) {
-        await setExactMatchCache(originalMessage, session.level, subLevel, response);
-        await setSemanticCache(originalMessage, session.level, subLevel, response);
+    let responseText = response;
+    let images = [];
+
+    // Deteksi blok visualisasi
+    const vizRegex = /\[VISUALISASI\]([\s\S]*?)\[\/VISUALISASI\]/;
+    const match = responseText.match(vizRegex);
+    if (match) {
+        try {
+            const vizData = JSON.parse(match[1].trim());
+            let imageUrl = null;
+            if (vizData.type === 'latex') {
+                imageUrl = generateLatexUrl(vizData.data);
+            } else if (vizData.type === 'chart') {
+                imageUrl = generateChartUrl(vizData.data);
+            }
+            if (imageUrl) {
+                images.push(imageUrl);
+                responseText = responseText.replace(vizRegex, '📊 Lihat gambar visualisasi di bawah ini.');
+            }
+        } catch (err) {
+            logger.error('Failed to parse visualization block:', err);
+            responseText = responseText.replace(vizRegex, '');
+        }
     }
 
+    // Cache hanya jika bukan error
+    if (!responseText.includes('gangguan teknis') && !responseText.includes('Maaf')) {
+        await setExactMatchCache(originalMessage, session.level, subLevel, responseText);
+        await setSemanticCache(originalMessage, session.level, subLevel, responseText);
+    }
+
+    // Simpan history
     session.history = session.history || [];
     session.history.push({ role: 'user', content: originalMessage });
-    session.history.push({ role: 'assistant', content: response });
+    session.history.push({ role: 'assistant', content: responseText });
     await saveSession(userId, session);
     await saveConversation(userId, 'user', originalMessage);
-    await saveConversation(userId, 'assistant', response);
+    await saveConversation(userId, 'assistant', responseText);
 
-    const actualTokens = countTokens(fullPrompt + response);
+    const actualTokens = countTokens(fullPrompt + responseText);
     await checkTokenQuota(userId, actualTokens);
 
-    return response;
+    return { text: responseText, images };
 }
 
 module.exports = { processMessage };
