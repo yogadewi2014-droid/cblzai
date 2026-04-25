@@ -36,7 +36,6 @@ async function getExactMatchCache(question, level, subLevel) {
 
 async function setExactMatchCache(question, level, subLevel, response) {
     if (!redis) return;
-    // Jangan simpan error
     if (response.includes('gangguan teknis') || response.includes('Maaf')) return;
     const hash = crypto.createHash('md5').update(`${question}|${level}|${subLevel}`).digest('hex');
     await redis.set(`exact:${hash}`, JSON.stringify(response), { ex: config.cacheTTL.exactMatch });
@@ -47,7 +46,10 @@ async function getSemanticCache(question, level, subLevel) {
     if (!redis) return null;
     try {
         const emb = await generateEmbedding(question);
-        if (!emb) return null;
+        if (!emb) {
+            logger.warn('Embedding generation failed, skipping semantic cache');
+            return null;
+        }
 
         const pattern = `semantic:${level}:${subLevel}:*`;
         const keys = await redis.keys(pattern);
@@ -57,7 +59,12 @@ async function getSemanticCache(question, level, subLevel) {
         for (const key of keys) {
             const data = await redis.get(key);
             if (!data) continue;
-            const cached = (typeof data === 'object') ? data : JSON.parse(data);
+            let cached;
+            try {
+                cached = (typeof data === 'object') ? data : JSON.parse(data);
+            } catch {
+                continue;
+            }
             if (!cached.embedding) continue;
 
             const similarity = cosineSimilarity(emb, cached.embedding);
@@ -82,7 +89,10 @@ async function setSemanticCache(question, level, subLevel, response) {
     if (response.includes('gangguan teknis') || response.includes('Maaf')) return;
     try {
         const emb = await generateEmbedding(question);
-        if (!emb) return;
+        if (!emb) {
+            logger.warn('Embedding generation failed, skipping save to semantic cache');
+            return;
+        }
 
         const hash = crypto.createHash('md5').update(`${question}|${level}|${subLevel}`).digest('hex');
         const key = `semantic:${level}:${subLevel}:${hash}`;
