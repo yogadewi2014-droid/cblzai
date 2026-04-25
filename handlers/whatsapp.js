@@ -1,23 +1,21 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
 const { getSession, saveSession } = require('../conversation/sessionManager');
 const { getUser, createUser, updateUserLevel } = require('../services/supabase');
 const { processMessage } = require('./messageProcessor');
+const axios = require('axios');
+const { MessageMedia } = require('whatsapp-web.js');
 const logger = require('../utils/logger');
 
 function setupWhatsAppHandler(client) {
     client.on('message', async (msg) => {
-        // Hindari memproses pesan sendiri atau broadcast
         if (msg.fromMe || msg.isGroupMsg) return;
 
         const userId = `whatsapp:${msg.from}`;
         let session = await getSession(userId);
         let user = await getUser(userId);
 
-        // Onboarding jika belum pilih jenjang
+        // Onboarding
         if (!user || !session?.level) {
             if (!session) session = { level: null, subLevel: null, history: [] };
-
-            // Deteksi pilihan dari pesan
             const text = msg.body.trim();
             if (text === '1' || text === '2' || text === '3' || text === '4' || text === '5') {
                 let level, subLevel;
@@ -36,24 +34,31 @@ function setupWhatsAppHandler(client) {
                 await saveSession(userId, session);
                 return msg.reply(`✅ Siap! Kamu terdaftar sebagai siswa ${getUserLevelText(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
             } else {
-                // Kirim pesan onboarding
                 return msg.reply(`👋 Halo! Aku Yenni, asisten belajar AI.\nPilih jenjang pendidikanmu dulu yuk:\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\n\nBalas dengan *angka* pilihanmu ya.`);
             }
         }
 
+        // Tampilkan status mengetik
+        client.sendPresenceUpdate('composing', msg.from);
+
         // Handle gambar (OCR)
-        let messageText = msg.body;
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
                 if (media && media.mimetype.startsWith('image/')) {
-                    // Simpan buffer untuk diproses vision
                     const buffer = Buffer.from(media.data, 'base64');
-                    // Kirim ke messageProcessor dengan prefix khusus
                     const caption = msg.body || 'Jelaskan gambar ini';
-                    msg.reply('🔍 Yenni lagi baca tulisannya ya...');
-                    const response = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', buffer);
-                    return msg.reply(response);
+                    // Kirim pesan sementara
+                    await msg.reply('🔍 Yenni lagi baca tulisannya ya...');
+
+                    const result = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', buffer);
+                    await msg.reply(result.text);
+                    for (const imageUrl of result.images) {
+                        const imageBuffer = await downloadImageBuffer(imageUrl);
+                        const media = new MessageMedia('image/png', imageBuffer.toString('base64'));
+                        await client.sendMessage(msg.from, media);
+                    }
+                    return;
                 }
             } catch (err) {
                 logger.error('WhatsApp media error:', err);
@@ -61,24 +66,28 @@ function setupWhatsAppHandler(client) {
             }
         }
 
-        // Proses pesan teks biasa
+        // Pesan teks biasa
+        const messageText = msg.body;
         if (messageText && messageText.length > 0) {
-            client.sendPresenceAvailable();
-            client.sendSeen(msg.from, msg.id._serialized);
-            await new Promise(resolve => setTimeout(resolve, 500)); // simulasi membaca
-            client.sendPresenceComposing(msg.from);
-            
             try {
-                const response = await processMessage(userId, messageText, session, 'whatsapp');
-                // WhatsApp tidak mendukung format Markdown sepenuhnya, bersihkan
-                const cleanResponse = response.replace(/[*_~`]/g, '');
-                msg.reply(cleanResponse);
+                const result = await processMessage(userId, messageText, session, 'whatsapp');
+                await msg.reply(result.text);
+                for (const imageUrl of result.images) {
+                    const imageBuffer = await downloadImageBuffer(imageUrl);
+                    const media = new MessageMedia('image/png', imageBuffer.toString('base64'));
+                    await client.sendMessage(msg.from, media);
+                }
             } catch (error) {
                 logger.error('WhatsApp process error:', error);
                 msg.reply('😔 Maaf, ada gangguan. Coba lagi ya.');
             }
         }
     });
+}
+
+async function downloadImageBuffer(url) {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
 }
 
 function getUserLevelText(level, subLevel) {
