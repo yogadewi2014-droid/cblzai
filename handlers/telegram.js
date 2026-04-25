@@ -61,16 +61,21 @@ function setupTelegramHandler(bot) {
     }
 
     try {
-      const response = await processMessage(userId, message, session, 'telegram');
+      const result = await processMessage(userId, message, session, 'telegram');
 
-      // Pisahkan jika terlalu panjang
-      if (response.length > 4000) {
-        const chunks = splitMessage(response, 4000);
+      // Kirim teks (potong jika panjang)
+      if (result.text.length > 4000) {
+        const chunks = splitMessage(result.text, 4000);
         for (const chunk of chunks) {
           await ctx.reply(chunk, { parse_mode: 'HTML' });
         }
       } else {
-        await ctx.reply(response, { parse_mode: 'HTML' });
+        await ctx.reply(result.text, { parse_mode: 'HTML' });
+      }
+
+      // Kirim gambar visualisasi
+      for (const imageUrl of result.images) {
+        await ctx.replyWithPhoto(imageUrl);
       }
     } catch (error) {
       logger.error('Telegram process error:', error);
@@ -78,12 +83,11 @@ function setupTelegramHandler(bot) {
     }
   });
 
+  // Handle foto (OCR)
   bot.on('photo', async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     const session = await getSession(userId);
-    if (!session?.level) {
-      return ctx.reply('Pilih jenjang dulu dengan /start ya.');
-    }
+    if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
 
     try {
       await ctx.sendChatAction('upload_photo');
@@ -92,14 +96,44 @@ function setupTelegramHandler(bot) {
     }
 
     try {
-      const fileId = ctx.message.photo.pop().file_id;
+      const photo = ctx.message.photo.pop();
+      if (!photo) throw new Error('No photo object');
+
+      const fileId = photo.file_id;
       const fileUrl = await ctx.telegram.getFileLink(fileId);
+      if (!fileUrl || !fileUrl.href) throw new Error('Invalid file URL');
+
       const caption = ctx.message.caption || 'Jelaskan gambar ini.';
-      const response = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${caption}`, session, 'telegram');
-      await ctx.reply(response, { parse_mode: 'HTML' });
+      const escapedCaption = caption.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+      logger.info(`Processing image for user ${userId}, url: ${fileUrl.href}`);
+
+      const result = await processMessage(userId, `[IMAGE]${fileUrl.href}\n${escapedCaption}`, session, 'telegram');
+
+      const safeText = result.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      if (safeText.length > 4000) {
+        const chunks = splitMessage(safeText, 4000);
+        for (const chunk of chunks) {
+          await ctx.reply(chunk, { parse_mode: 'HTML' });
+        }
+      } else {
+        await ctx.reply(safeText, { parse_mode: 'HTML' });
+      }
+
+      for (const imageUrl of result.images) {
+        await ctx.replyWithPhoto(imageUrl);
+      }
     } catch (error) {
-      logger.error('Telegram photo process error:', error);
-      await ctx.reply('😔 Maaf, gambar tidak bisa diproses. Coba kirim ulang ya.');
+      logger.error('Telegram photo process error:', { message: error.message, stack: error.stack });
+      let userMessage = '😔 Maaf, gambar tidak bisa diproses. ';
+      if (error.message.includes('DOWNLOAD_FAILED')) {
+        userMessage += 'Gagal mengunduh gambar. Coba kirim ulang ya.';
+      } else if (error.message.includes('OCR_FAILED')) {
+        userMessage += 'Tulisan di gambar kurang jelas, bisa difoto lebih dekat?';
+      } else {
+        userMessage += 'Coba lagi nanti ya.';
+      }
+      await ctx.reply(userMessage);
     }
   });
 }
