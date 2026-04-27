@@ -1,10 +1,14 @@
 const { getSession, saveSession } = require('../conversation/sessionManager');
 const { getUser, createUser, updateUserLevel } = require('../services/supabase');
 const { processMessage } = require('./messageProcessor');
+const { transcribeAudio } = require('../services/speechToText');
+const { isPremium, getRemainingChats } = require('../services/quotaManager');
+const { createSubscription } = require('../services/xendit');
+const axios = require('axios');
 const logger = require('../utils/logger');
 
 function setupTelegramHandler(bot) {
-  // ==================== /START COMMAND ====================
+  // ==================== /START ====================
   bot.start(async (ctx) => {
     const userId = `telegram:${ctx.from.id}`;
     let user = await getUser(userId);
@@ -25,6 +29,114 @@ function setupTelegramHandler(bot) {
     await saveSession(userId, session);
     const levelText = getUserLevelText(user.level, user.sub_level);
     await ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
+  });
+
+  // ==================== /GANTI_LEVEL ====================
+  bot.command('ganti_level', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const user = await getUser(userId);
+    if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
+
+    // Reset level di session
+    const session = await getSession(userId);
+    session.level = null;
+    session.subLevel = null;
+    await saveSession(userId, session);
+
+    return ctx.reply(
+      `🔁 Kakak mau pindah ke jenjang mana nih?\n\n` +
+      `1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\n\n` +
+      `Balas dengan angka pilihanmu ya.`
+    );
+  });
+
+  // ==================== /UPGRADE ====================
+  bot.command('upgrade', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const user = await getUser(userId);
+    if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
+
+    const premium = await isPremium(userId);
+    if (premium) {
+      return ctx.reply('✨ Kakak sudah menjadi member **Yenni Premium**! Belajar sepuasnya tanpa batas~');
+    }
+
+    const level = user.level || 'sd-smp';
+    const p = getPricingText(level);
+
+    return ctx.reply(
+      `🚀 *Upgrade ke Yenni Premium*\n\n` +
+      `Dapatkan akses *unlimited chat* untuk belajar sepuasnya!\n\n` +
+      `📋 *Pilihan Paket:*\n` +
+      `- Mingguan: *Rp12.000* / 7 hari\n` +
+      `- Bulanan: *Rp35.000* / 30 hari\n\n` +
+      `Ketik */bayar mingguan* atau */bayar bulanan* untuk lanjut ke pembayaran ya~ 💳\n\n` +
+      `Pembayaran bisa via *QRIS*, GoPay, Dana, ShopeePay, dll.`
+    );
+  });
+
+  // ==================== /BAYAR ====================
+  bot.command('bayar', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const user = await getUser(userId);
+    if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
+
+    const premium = await isPremium(userId);
+    if (premium) {
+      return ctx.reply('✨ Kakak sudah premium! Tidak perlu bayar lagi~');
+    }
+
+    const args = ctx.message.text.split(' ');
+    const packageKey = args[1]; // 'mingguan' atau 'bulanan'
+
+    if (!packageKey || !['mingguan', 'bulanan'].includes(packageKey)) {
+      return ctx.reply('Ketik */bayar mingguan* atau */bayar bulanan* ya, Kak.');
+    }
+
+    try {
+      await ctx.reply('⏳ Yenni lagi buatkan link pembayaran...');
+      const invoice = await createSubscription(userId, packageKey === 'mingguan' ? 'weekly' : 'monthly', ctx.from.first_name);
+
+      await ctx.reply(
+        `💳 *Pembayaran Yenni Premium - Paket ${packageKey === 'mingguan' ? 'Mingguan (Rp12.000)' : 'Bulanan (Rp35.000)'}*\n\n` +
+        `Klik link atau scan QR code di bawah untuk bayar:\n` +
+        `${invoice.payment_link_url}\n\n` +
+        `⏰ Link berlaku 24 jam.\n` +
+        `Setelah bayar, premium otomatis aktif ya, Kak~`
+      );
+
+      // Kirim QR code sebagai gambar
+      if (invoice.qr_code_url) {
+        await ctx.replyWithPhoto(invoice.qr_code_url, { caption: '📱 Scan QRIS di atas pakai HP Kakak~' });
+      }
+    } catch (error) {
+      logger.error('Payment error:', error);
+      await ctx.reply('😔 Maaf, ada gangguan di sistem pembayaran. Coba lagi nanti ya, Kak.');
+    }
+  });
+
+  // ==================== /STATUS ====================
+  bot.command('status', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const user = await getUser(userId);
+    if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
+
+    const premium = await isPremium(userId);
+    const remaining = await getRemainingChats(userId);
+
+    let statusText = `📊 *Status Akun Yenni*\n\n`;
+    statusText += `Jenjang: ${getUserLevelText(user.level, user.sub_level)}\n`;
+    statusText += `Status: ${premium ? '✨ Premium (Unlimited)' : '🆓 Gratis'}\n`;
+
+    if (!premium) {
+      statusText += `Chat gratis hari ini: *${remaining}/10*\n`;
+    }
+
+    if (!premium) {
+      statusText += `\nKetik */upgrade* buat langganan Premium~`;
+    }
+
+    await ctx.reply(statusText, { parse_mode: 'Markdown' });
   });
 
   // ==================== HANDLE TEXT MESSAGES ====================
@@ -112,9 +224,7 @@ function setupTelegramHandler(bot) {
       const fileUrl = await ctx.telegram.getFileLink(fileId);
       if (!fileUrl || !fileUrl.href) throw new Error('Invalid file URL');
 
-      // Bersihkan URL dari karakter aneh (newline, spasi, dll)
       const cleanUrl = fileUrl.href.split('\n')[0].trim();
-      
       const caption = ctx.message.caption || 'Jelaskan gambar ini.';
       const escapedCaption = escapeHtml(caption);
 
@@ -122,7 +232,6 @@ function setupTelegramHandler(bot) {
 
       const result = await processMessage(userId, `[IMAGE]${cleanUrl}\n${escapedCaption}`, session, 'telegram');
 
-      // Kirim teks (sudah aman HTML)
       const safeText = escapeHtml(result.text);
       if (safeText.length > 4000) {
         const chunks = splitMessage(safeText, 4000);
@@ -133,7 +242,6 @@ function setupTelegramHandler(bot) {
         await ctx.reply(safeText, { parse_mode: 'HTML' });
       }
 
-      // Kirim gambar visualisasi
       for (const imageUrl of result.images) {
         try {
           await ctx.replyWithPhoto(imageUrl);
@@ -165,7 +273,6 @@ function setupTelegramHandler(bot) {
     const doc = ctx.message.document;
     const fileName = doc.file_name || '';
 
-    // Hanya proses PDF
     if (!fileName.toLowerCase().endsWith('.pdf')) {
       return ctx.reply('📎 Untuk saat ini Yenni hanya bisa membaca file PDF. Kirim sebagai gambar kalau mau tanya soal ya.');
     }
@@ -181,9 +288,7 @@ function setupTelegramHandler(bot) {
       const fileUrl = await ctx.telegram.getFileLink(fileId);
       if (!fileUrl || !fileUrl.href) throw new Error('Invalid file URL');
 
-      // Bersihkan URL
       const cleanUrl = fileUrl.href.split('\n')[0].trim();
-      
       const caption = ctx.message.caption || 'Jelaskan isi PDF ini.';
       const escapedCaption = escapeHtml(caption);
 
@@ -191,7 +296,6 @@ function setupTelegramHandler(bot) {
 
       const result = await processMessage(userId, `[PDF]${cleanUrl}\n${escapedCaption}`, session, 'telegram');
 
-      // Kirim teks
       const safeText = escapeHtml(result.text);
       if (safeText.length > 4000) {
         const chunks = splitMessage(safeText, 4000);
@@ -202,7 +306,6 @@ function setupTelegramHandler(bot) {
         await ctx.reply(safeText, { parse_mode: 'HTML' });
       }
 
-      // Kirim gambar visualisasi
       for (const imageUrl of result.images) {
         try {
           await ctx.replyWithPhoto(imageUrl);
@@ -224,10 +327,73 @@ function setupTelegramHandler(bot) {
       await ctx.reply(userMessage);
     }
   });
+
+  // ==================== HANDLE VOICE MESSAGE ====================
+  bot.on('voice', async (ctx) => {
+    const userId = `telegram:${ctx.from.id}`;
+    const session = await getSession(userId);
+    if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
+
+    try {
+      await ctx.sendChatAction('record_voice');
+    } catch (actionErr) {
+      logger.warn('Failed to send record_voice action:', actionErr);
+    }
+
+    try {
+      const voice = ctx.message.voice;
+      if (!voice) throw new Error('No voice object');
+
+      const fileId = voice.file_id;
+      const fileUrl = await ctx.telegram.getFileLink(fileId);
+      if (!fileUrl || !fileUrl.href) throw new Error('Invalid voice file URL');
+
+      logger.info(`Processing voice for user ${userId}, duration: ${voice.duration}s`);
+
+      const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
+      const audioBuffer = Buffer.from(response.data);
+
+      await ctx.reply('🎤 Yenni dengerin suara Kakak dulu ya...');
+      const transcribedText = await transcribeAudio(audioBuffer, 'audio/ogg');
+
+      if (!transcribedText || transcribedText.trim().length === 0) {
+        return ctx.reply('🎤 Maaf Kak, Yenni tidak bisa mendengar apa yang Kakak katakan. Bisa ulangi lagi?');
+      }
+
+      await ctx.reply(`📝 Yenni dengar: "${transcribedText}"`);
+
+      const result = await processMessage(userId, transcribedText, session, 'telegram');
+
+      if (result.text.length > 4000) {
+        const chunks = splitMessage(result.text, 4000);
+        for (const chunk of chunks) {
+          await ctx.reply(chunk, { parse_mode: 'HTML' });
+        }
+      } else {
+        await ctx.reply(result.text, { parse_mode: 'HTML' });
+      }
+
+      for (const imageUrl of result.images) {
+        try {
+          await ctx.replyWithPhoto(imageUrl);
+        } catch (imgErr) {
+          logger.error('Failed to send visualization:', imgErr);
+        }
+      }
+    } catch (error) {
+      logger.error('Voice processing error:', { message: error.message, stack: error.stack });
+      let userMessage = '🎤 Maaf, suara Kakak tidak bisa diproses. ';
+      if (error.message.includes('TRANSCRIBE_FAILED')) {
+        userMessage += 'Ada kendala dengan layanan transkripsi. Coba lagi nanti ya.';
+      } else {
+        userMessage += 'Coba kirim ulang pesan suaranya atau ketik pertanyaanmu ya.';
+      }
+      await ctx.reply(userMessage);
+    }
+  });
 }
 
 // ==================== HELPER FUNCTIONS ====================
-
 function splitMessage(text, maxLength) {
   const chunks = [];
   let current = '';
@@ -262,6 +428,14 @@ function getUserLevelText(level, subLevel) {
     'smk': 'SMK'
   };
   return map[subLevel] || level;
+}
+
+function getPricingText(level) {
+  // Tidak digunakan langsung, tapi untuk konsistensi
+  return {
+    'sd-smp': { weekly: 12000, monthly: 35000 },
+    'sma-smk': { weekly: 12000, monthly: 35000 }
+  }[level] || { weekly: 12000, monthly: 35000 };
 }
 
 module.exports = { setupTelegramHandler };
