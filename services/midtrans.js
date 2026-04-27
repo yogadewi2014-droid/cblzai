@@ -1,14 +1,14 @@
 const midtransClient = require('midtrans-client');
 const logger = require('../utils/logger');
 
-// Konfigurasi Midtrans
+// Snap digunakan untuk membuat payment link
 const snap = new midtransClient.Snap({
     isProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
-// Konfigurasi Core API
+// Core API untuk verifikasi status transaksi
 const core = new midtransClient.CoreApi({
     isProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
     serverKey: process.env.MIDTRANS_SERVER_KEY,
@@ -30,18 +30,17 @@ const PACKAGES = {
 };
 
 /**
- * Membuat payment link menggunakan Snap (mendukung QRIS otomatis)
- * @param {string} orderId - ID unik pesanan (contoh: yenni-sub-{userId}-{timestamp})
+ * Membuat payment link menggunakan Snap (mendukung QRIS dan semua metode)
+ * @param {string} userId - ID pengguna Yenni
  * @param {string} packageKey - 'weekly' atau 'monthly'
- * @param {string} customerName - nama pelanggan
- * @param {string} customerEmail - email pelanggan
- * @param {string} customerPhone - nomor telepon pelanggan
- * @returns {object} { payment_link_url, order_id }
+ * @param {string} customerName - Nama pelanggan (opsional)
+ * @returns {Promise<{payment_link_url: string, order_id: string}>}
  */
-async function createPaymentLink(userId, packageKey, customerName = '', customerEmail = '', customerPhone = '') {
+async function createPaymentLink(userId, packageKey, customerName = '') {
     const pkg = PACKAGES[packageKey];
     if (!pkg) throw new Error('Paket tidak ditemukan');
 
+    // Buat order ID unik
     const orderId = `yenni-${packageKey}-${userId}-${Date.now()}`;
 
     const parameter = {
@@ -49,7 +48,6 @@ async function createPaymentLink(userId, packageKey, customerName = '', customer
             order_id: orderId,
             gross_amount: pkg.amount
         },
-        credit_card: { secure: true },
         item_details: [{
             id: `yenni-premium-${packageKey}`,
             price: pkg.amount,
@@ -59,11 +57,10 @@ async function createPaymentLink(userId, packageKey, customerName = '', customer
         customer_details: {
             first_name: customerName || 'Pelanggan',
             last_name: 'Yenni',
-            email: customerEmail || `${userId}@yenni.user`,
-            phone: customerPhone || ''
+            email: `${userId}@yenni.user`  // email placeholder
         },
         callbacks: {
-            finish: 'https://t.me/YenniAsistenBot'  // Redirect setelah pembayaran
+            finish: 'https://t.me/YenniAsistenBot'  // redirect setelah pembayaran
         },
         metadata: {
             user_id: userId,
@@ -86,9 +83,9 @@ async function createPaymentLink(userId, packageKey, customerName = '', customer
 }
 
 /**
- * Mendapatkan status transaksi dari Midtrans
+ * Verifikasi status transaksi dari Midtrans (digunakan webhook)
  * @param {string} orderId
- * @returns {object} status transaksi
+ * @returns {Promise<object>} Status transaksi
  */
 async function getTransactionStatus(orderId) {
     try {
