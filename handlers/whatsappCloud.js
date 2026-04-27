@@ -1,3 +1,4 @@
+// handlers/whatsappCloud.js
 const { getSession, saveSession } = require('../conversation/sessionManager');
 const { getUser, createUser, updateUserLevel } = require('../services/supabase');
 const { processMessage } = require('./messageProcessor');
@@ -6,7 +7,7 @@ const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor')
 const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
 const { isPremium, checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
-const { createPaymentLink, PACKAGES } = require('../services/midtrans');
+const { createPaymentLink } = require('../services/midtrans');
 const axios = require('axios');
 const logger = require('../utils/logger');
 
@@ -41,6 +42,7 @@ async function processIncomingMessage(msg) {
     let session = await getSession(userId);
     let user = await getUser(userId);
 
+    // ===== TEXT =====
     if (msg.type === 'text') {
         const text = (msg.text?.body || '').trim();
         if (!user || !session?.level) {
@@ -68,19 +70,14 @@ async function processIncomingMessage(msg) {
         }
         if (text === 'upgrade') {
             const premium = await isPremium(userId);
-            if (premium) return sendText(from, '✨ Kamu sudah member Premium!');
+            if (premium) return sendText(from, '✨ Kamu sudah member Yenni Premium!');
             return sendText(from, `🚀 Upgrade Yenni Premium\nMingguan Rp12.000 / 7 hari\nBulanan Rp35.000 / 30 hari\nBalas "bayar mingguan" atau "bayar bulanan"`);
         }
         if (text.startsWith('bayar')) {
             const pkg = text.includes('mingguan') ? 'weekly' : 'monthly';
             try {
                 const invoice = await createPaymentLink(userId, pkg);
-                return sendText(from,
-                    `💳 Pembayaran Yenni Premium (${PACKAGES[pkg].name})\n\n` +
-                    `Klik link untuk membayar:\n${invoice.payment_link_url}\n\n` +
-                    `QRIS dan semua metode pembayaran tersedia.\n` +
-                    `Premium aktif otomatis setelah pembayaran.`
-                );
+                return sendText(from, `💳 Link pembayaran:\n${invoice.payment_link_url}`);
             } catch (e) { return sendText(from, '😔 Gangguan pembayaran. Coba lagi nanti.'); }
         }
         if (text === 'status') {
@@ -98,6 +95,8 @@ async function processIncomingMessage(msg) {
             await sendText(from, '😔 Maaf, ada gangguan. Coba lagi ya.');
         }
     }
+
+    // ===== IMAGE =====
     else if (msg.type === 'image') {
         try {
             const imageId = (msg.image || {}).id;
@@ -113,6 +112,8 @@ async function processIncomingMessage(msg) {
             await sendText(from, '😔 Gambar tidak bisa diproses.');
         }
     }
+
+    // ===== VOICE =====
     else if (msg.type === 'audio' || msg.type === 'voice') {
         const voiceQuota = await checkTypeQuota(userId, 'voice');
         if (!voiceQuota.allowed && !voiceQuota.isPremium) {
@@ -123,11 +124,13 @@ async function processIncomingMessage(msg) {
             const audioUrl = await getMediaUrl(audioId);
             const resp = await axios.get(audioUrl,{responseType:'arraybuffer'});
             const audioBuffer = Buffer.from(resp.data);
+
             await sendText(from, '🎤 Yenni dengerin suara Kakak...');
             const transcribed = await transcribeAudio(audioBuffer,'audio/ogg');
             if (!transcribed) return sendText(from, '🎤 Maaf, tidak bisa mendengar.');
             await sendText(from, `📝 Yenni dengar: "${transcribed}"`);
             await incrementTypeQuota(userId, 'voice');
+
             const result = await processMessage(userId, transcribed, session, 'whatsapp');
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
@@ -135,6 +138,8 @@ async function processIncomingMessage(msg) {
             await sendText(from, '🎤 Suara tidak bisa diproses.');
         }
     }
+
+    // ===== DOCUMENT =====
     else if (msg.type === 'document') {
         try {
             const doc = msg.document || {};
@@ -152,6 +157,7 @@ async function processIncomingMessage(msg) {
     }
 }
 
+// ==================== HELPERS ====================
 async function sendText(to, text) {
     try {
         await axios.post(WA_API_URL, {
@@ -172,7 +178,7 @@ async function sendImage(to, url) {
 
 async function sendLongTextWA(to, text, images) {
     if (text.length > 1500) {
-        for (const chunk of splitWA(text, 1500)) await sendText(to, chunk);
+        for (const chunk of splitMessage(text, 1500)) await sendText(to, chunk);
     } else await sendText(to, text);
     for (const url of images) { try { await sendImage(to, url); } catch (e) {} }
 }
@@ -184,7 +190,7 @@ async function getMediaUrl(mediaId) {
     return resp.data.url;
 }
 
-function splitWA(text, max) {
+function splitMessage(text, max) {
     const chunks = []; let cur = '';
     for (const w of text.split(' ')) {
         if ((cur + ' ' + w).length > max) { chunks.push(cur.trim()); cur = w; }
