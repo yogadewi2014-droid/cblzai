@@ -19,7 +19,7 @@ const core = new midtransClient.CoreApi({
 const PACKAGES = {
     weekly: {
         name: 'Mingguan',
-        amount: 12000,
+        amount: 15000,
         durationDays: 7
     },
     monthly: {
