@@ -3,7 +3,7 @@ const { getUser, createUser, updateUserLevel } = require('../services/supabase')
 const { processMessage } = require('./messageProcessor');
 const { transcribeAudio } = require('../services/speechToText');
 const { isPremium, checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
-const { createSubscription } = require('../services/xendit');
+const { createPaymentLink, PACKAGES } = require('../services/midtrans');
 const axios = require('axios');
 const logger = require('../utils/logger');
 
@@ -57,12 +57,17 @@ function setupTelegramHandler(bot) {
         const payload = ctx.message.text.split(' ')[1];
         const pkg = (payload === 'mingguan') ? 'weekly' : 'monthly';
         try {
-            const invoice = await createSubscription(userId, pkg, ctx.from.first_name);
+            const invoice = await createPaymentLink(userId, pkg, ctx.from.first_name);
             await ctx.reply(
-                `💳 Pembayaran Yenni Premium\n\nLink atau scan QRIS di bawah:\n${invoice.payment_link_url}\n\nBerlaku 24 jam. Premium aktif otomatis setelah pembayaran.`
+                `💳 *Pembayaran Yenni Premium (${PACKAGES[pkg].name})*\n\n` +
+                `Klik link berikut untuk membayar:\n${invoice.payment_link_url}\n\n` +
+                `QRIS dan semua metode pembayaran tersedia di halaman Midtrans.\n` +
+                `⏰ Link berlaku 24 jam.\n` +
+                `Setelah bayar, premium akan aktif otomatis~\n\n` +
+                `Cek status: /status`
             );
         } catch (error) {
-            logger.error('Failed to create payment:', error);
+            logger.error('Failed to create Midtrans payment:', error);
             await ctx.reply('😔 Gangguan sistem pembayaran. Coba lagi nanti ya.');
         }
     });
