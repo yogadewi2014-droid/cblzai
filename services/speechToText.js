@@ -14,11 +14,12 @@ async function transcribeAudio(audioBuffer, mimeType = 'audio/ogg') {
         const transcription = await openai.audio.transcriptions.create({
             model: 'gpt-4o-mini-transcribe',
             file,
-            language: 'id'
+            language: 'id',          // wajib
+            response_format: 'text'  // opsional, lebih ringan
         });
 
-        logger.info(`Transcribed: "${transcription.text.substring(0, 50)}..."`);
-        return transcription.text;
+        logger.info(`Transcribed: "${transcription.substring(0, 50)}..."`);
+        return transcription;
     } catch (error) {
         logger.error('Transcribe error:', error);
         throw new Error('TRANSCRIBE_FAILED: ' + error.message);
