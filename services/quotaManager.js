@@ -7,7 +7,11 @@ if (config.upstashRedisUrl && config.upstashRedisToken) {
     redis = new Redis({ url: config.upstashRedisUrl, token: config.upstashRedisToken });
 }
 
-const FREE_CHAT_LIMIT = 10;
+const LIMITS = {
+    text: 10,
+    image: 3,
+    voice: 5
+};
 
 async function isPremium(userId) {
     if (!redis) return false;
@@ -21,41 +25,51 @@ async function activatePremium(userId, durationDays = 30) {
     logger.info(`Premium activated for ${userId}, ${durationDays} days`);
 }
 
-async function checkChatQuota(userId) {
+function getQuotaKey(userId, type) {
+    const today = new Date().toISOString().slice(0, 10);
+    return `quota:${userId}:${type}:${today}`;
+}
+
+async function checkTypeQuota(userId, type) {
     if (!redis) return { allowed: true, remaining: -1, isPremium: false };
     const premium = await isPremium(userId);
     if (premium) return { allowed: true, remaining: -1, isPremium: true };
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `chat_count:${userId}:${today}`;
+    const limit = LIMITS[type] || 10;
+    const key = getQuotaKey(userId, type);
     const count = parseInt(await redis.get(key)) || 0;
     return {
-        allowed: count < FREE_CHAT_LIMIT,
-        remaining: Math.max(0, FREE_CHAT_LIMIT - count),
-        isPremium: false
+        allowed: count < limit,
+        remaining: Math.max(0, limit - count),
+        isPremium: false,
+        limit
     };
 }
 
-async function incrementChatCount(userId) {
+async function incrementTypeQuota(userId, type) {
     if (!redis) return;
     const premium = await isPremium(userId);
     if (premium) return;
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `chat_count:${userId}:${today}`;
+    const key = getQuotaKey(userId, type);
     const count = await redis.incr(key);
     if (count === 1) {
         const now = new Date();
         const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-        await redis.expire(key, Math.floor((endOfDay - now) / 1000));
+        const ttl = Math.floor((endOfDay - now) / 1000);
+        await redis.expire(key, ttl);
     }
 }
 
-async function getRemainingChats(userId) {
-    if (!redis) return FREE_CHAT_LIMIT;
+async function getAllRemaining(userId) {
+    if (!redis) return { text: LIMITS.text, image: LIMITS.image, voice: LIMITS.voice };
     const premium = await isPremium(userId);
-    if (premium) return -1;
-    const today = new Date().toISOString().slice(0, 10);
-    const count = parseInt(await redis.get(`chat_count:${userId}:${today}`)) || 0;
-    return Math.max(0, FREE_CHAT_LIMIT - count);
+    if (premium) return { text: -1, image: -1, voice: -1 };
+    const result = {};
+    for (const t of Object.keys(LIMITS)) {
+        const key = getQuotaKey(userId, t);
+        const count = parseInt(await redis.get(key)) || 0;
+        result[t] = Math.max(0, LIMITS[t] - count);
+    }
+    return result;
 }
 
-module.exports = { isPremium, activatePremium, checkChatQuota, incrementChatCount, getRemainingChats };
+module.exports = { isPremium, activatePremium, checkTypeQuota, incrementTypeQuota, getAllRemaining, LIMITS };
