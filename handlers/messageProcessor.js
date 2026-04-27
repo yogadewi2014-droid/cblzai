@@ -13,9 +13,10 @@ const { getExactMatchCache, setExactMatchCache, getSemanticCache, setSemanticCac
 const { userRateLimit, checkTokenQuota, isDuplicateRequest } = require('../middleware/rateLimiter');
 const { generateLatexUrl, generateChartUrl } = require('../services/visualization');
 const { countTokens } = require('../utils/tokenCounter');
+const { isSimpleMath, isMediumMath, isHardReasoning } = require('../utils/router');
+const { checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
 const logger = require('../utils/logger');
 const config = require('../config');
-const { checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
 
 async function processMessage(userId, message, session, platform, imageBuffer = null) {
     const originalMessage = message;
@@ -26,15 +27,13 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
     const isDup = await isDuplicateRequest(userId, message);
     if (isDup) return { text: '🐢 Kakak sudah kirim pertanyaan yang sama. Yenni sedang memproses...', images: [] };
 
-    // Tentukan sub-jenjang
     const subLevel = session.subLevel || (session.level === 'sd-smp' ? 'smp' : 'sma');
 
-    // 2. Tentukan jenis input untuk kuota
+    // 2. Tentukan jenis kuota
     let quotaType = 'text';
     if (message.startsWith('[IMAGE]') || message.startsWith('[IMAGE_BUFFER]')) {
         quotaType = 'image';
     }
-    // Voice sudah ditangani di handler terpisah, jadi di sini hanya teks dan gambar
 
     const quota = await checkTypeQuota(userId, quotaType);
     if (!quota.allowed && !quota.isPremium) {
@@ -45,13 +44,10 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         };
     }
 
-    // 3. Tentukan apakah ini media (gambar/PDF) untuk skip semantic cache
-    const isMediaMessage = message.startsWith('[IMAGE]') || 
-                           message.startsWith('[IMAGE_BUFFER]') ||
-                           message.startsWith('[PDF]') || 
-                           message.startsWith('[PDF_TEXT]');
+    // 3. Cek cache
+    const isMediaMessage = message.startsWith('[IMAGE]') || message.startsWith('[IMAGE_BUFFER]') ||
+                           message.startsWith('[PDF]') || message.startsWith('[PDF_TEXT]');
 
-    // 4. Exact match cache (selalu)
     const exactCached = await getExactMatchCache(message, session.level, subLevel);
     if (exactCached) {
         await saveConversation(userId, 'user', message);
@@ -60,7 +56,6 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         return { text: exactCached, images: [] };
     }
 
-    // 5. Semantic cache hanya untuk teks biasa
     if (!isMediaMessage) {
         const semanticCached = await getSemanticCache(message, session.level, subLevel);
         if (semanticCached) {
@@ -71,7 +66,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         }
     }
 
-    // 6. Respons singkat follow-up dengan konteks spesifik
+    // 4. Follow-up singkat
     if (message.match(/^(mau|ya|lanjut|oke|sip|yes|lanjutkan|boleh)$/i)) {
         const lastAssistantMsg = session.history?.filter(m => m.role === 'assistant').pop();
         if (lastAssistantMsg?.content) {
@@ -79,7 +74,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         }
     }
 
-    // 7. Permintaan artikel
+    // 5. Artikel
     const articleMatch = message.match(/buat(?:kan)?\s+artikel\s+(?:tentang\s+)?(.+)/i);
     if (articleMatch) {
         const topic = articleMatch[1];
@@ -96,7 +91,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         return { text: articleResponse, images: [] };
     }
 
-    // 8. OCR Gambar (Telegram URL)
+    // 6. OCR & PDF (sama seperti sebelumnya)
     let extractedText = '';
     if (message.startsWith('[IMAGE]') && !message.startsWith('[IMAGE_BUFFER]')) {
         const imagePart = message.substring(7);
@@ -114,7 +109,6 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan gambar ini.'}`;
     }
 
-    // 9. OCR Gambar (WhatsApp buffer)
     if (message.startsWith('[IMAGE_BUFFER]')) {
         const caption = message.substring(13).trim() || 'Jelaskan gambar ini.';
         if (!imageBuffer) throw new Error('No image buffer provided');
@@ -126,7 +120,6 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption}`;
     }
 
-    // 10. PDF (Telegram)
     if (message.startsWith('[PDF]')) {
         const pdfPart = message.substring(5);
         const newlineIndex = pdfPart.indexOf('\n');
@@ -144,7 +137,6 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan isi PDF ini.'}`;
     }
 
-    // 11. PDF Teks (WhatsApp)
     if (message.startsWith('[PDF_TEXT]')) {
         const pdfPart = message.substring(9);
         const newlineIndex = pdfPart.indexOf('\n');
@@ -156,7 +148,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption}`;
     }
 
-    // 12. Search
+    // 7. Search
     const searchMatch = message.match(/cari(?:kan)?\s+(?:tentang\s+)?(.+)/i);
     if (searchMatch) {
         const query = searchMatch[1];
@@ -164,38 +156,42 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         message = `Informasi dari pencarian web:\n${searchSummary}\n\nPertanyaan pengguna: ${message}`;
     }
 
-    // 13. Bangun prompt & pilih LLM
+    // 8. Bangun prompt
     const systemPrompt = buildSystemPrompt(session);
     const context = await manageContext(userId, session, message);
     const fullPrompt = `${systemPrompt}\n\n${context}\n\nUser: ${message}`;
 
-    const isMathOrReasoning = /hitung|kpk|fpb|kelipatan|faktor|luas|volume|kecepatan|matematika|soal cerita|jam|menit|detik|grafik|fungsi|turunan|integral|aljabar/i.test(originalMessage);
-
+    // 9. Router pemilihan model
     let response;
     try {
-        if (session.level === 'sd-smp' && isMathOrReasoning) {
-            try { response = await callDeepSeek(fullPrompt); } 
-            catch { response = await callOpenAI(fullPrompt); }
-        } else if (session.level === 'sd-smp') {
-            response = await callGemini(fullPrompt);
-        } else {
-            const needsReasoning = /analisis|matematika|hitung|kode|program|soal sulit/i.test(message);
-            if (needsReasoning) {
-                try { response = await callDeepSeek(fullPrompt); } 
-                catch { response = await callOpenAI(fullPrompt); }
-            } else {
+        if (isSimpleMath(originalMessage)) {
+            try {
+                const result = Function(`"use strict"; return (${originalMessage})`)();
+                response = `✨ Hasil dari \`${originalMessage}\` adalah *${result}*`;
+                logger.info('Simple math evaluated locally');
+            } catch (evalErr) {
+                logger.warn('Simple math eval failed, fallback to Gemini');
                 response = await callGemini(fullPrompt);
             }
+        } else if (isHardReasoning(originalMessage)) {
+            try {
+                response = await callDeepSeek(fullPrompt);
+            } catch {
+                response = await callOpenAI(fullPrompt);
+            }
+        } else if (isMediumMath(originalMessage)) {
+            response = await callGemini(fullPrompt);
+        } else {
+            response = await callGemini(fullPrompt);
         }
     } catch (error) {
         logger.error('LLM error:', error);
         return { text: '😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.', images: [] };
     }
 
+    // 10. Visualisasi
     let responseText = response;
     let images = [];
-
-    // 14. Deteksi blok visualisasi
     const vizRegex = /\[VISUALISASI\]([\s\S]*?)\[\/VISUALISASI\]/;
     const match = responseText.match(vizRegex);
     if (match) {
@@ -214,7 +210,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         }
     }
 
-    // 15. Simpan cache (error TIDAK disimpan)
+    // 11. Cache
     if (!responseText.includes('gangguan teknis') && !responseText.includes('Maaf')) {
         await setExactMatchCache(originalMessage, session.level, subLevel, responseText);
         if (!isMediaMessage) {
@@ -222,7 +218,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         }
     }
 
-    // 16. Simpan history
+    // 12. Simpan history
     session.history = session.history || [];
     session.history.push({ role: 'user', content: originalMessage });
     session.history.push({ role: 'assistant', content: responseText });
@@ -230,15 +226,11 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
     await saveConversation(userId, 'user', originalMessage);
     await saveConversation(userId, 'assistant', responseText);
 
-    // 17. Increment kuota
+    // 13. Kuota & reminder
     await incrementTypeQuota(userId, quotaType);
-
-    // 18. Reminder upgrade
-   if (!quota.isPremium) {
+    if (!quota.isPremium) {
         const remaining = await getAllRemaining(userId);
         const totalRemaining = remaining.text + remaining.image + remaining.voice;
-
-        // Hanya tampilkan jika total sisa kuota ≤ 3 (hampir habis)
         if (totalRemaining <= 3) {
             if (totalRemaining === 0) {
                 responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni Premium biar unlimited. Ketik /upgrade atau /bayar ~';
@@ -251,6 +243,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
             }
         }
     }
+
     return { text: responseText, images };
 }
 
