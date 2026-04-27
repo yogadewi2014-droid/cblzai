@@ -5,7 +5,7 @@ const config = require('./config');
 const { initRedis, closeRedis } = require('./conversation/sessionManager');
 const { setupTelegramHandler } = require('./handlers/telegram');
 const { verifyWebhook, handleWebhook } = require('./handlers/whatsappCloud');
-const { verifyCallbackToken } = require('./services/xendit');
+const { getTransactionStatus } = require('./services/midtrans');
 const { activatePremium } = require('./services/quotaManager');
 const { ipLimiter } = require('./middleware/rateLimiter');
 const logger = require('./utils/logger');
@@ -31,33 +31,44 @@ if (process.env.WA_PHONE_NUMBER_ID && process.env.WA_ACCESS_TOKEN) {
     logger.info('WhatsApp Cloud API webhook registered');
 }
 
-// === XENDIT PAYMENT WEBHOOK ===
-app.post('/webhook/xendit', async (req, res) => {
+// === MIDTRANS PAYMENT NOTIFICATION WEBHOOK ===
+app.post('/webhook/midtrans', async (req, res) => {
     try {
-        const token = req.headers['x-callback-token'];
-        if (token !== process.env.XENDIT_CALLBACK_TOKEN) {
-            logger.warn('Xendit webhook: invalid token');
-            return res.status(403).json({ error: 'Forbidden' });
-        }
+        const notification = req.body;
+        logger.info('Midtrans notification:', {
+            order_id: notification.order_id,
+            transaction_status: notification.transaction_status
+        });
 
-        const event = req.body;
-        logger.info('Xendit event:', event.event);
+        if (notification.order_id) {
+            // Verifikasi langsung ke Midtrans (hindari spoofing)
+            const status = await getTransactionStatus(notification.order_id);
+            logger.info('Midtrans verified status:', status);
 
-        if (event.event === 'subscription.succeeded' || event.event === 'recurring_plan.activated') {
-            const meta = event.data?.metadata;
-            const userId = meta?.user_id;
-            const pkg = meta?.package;
-            if (userId) {
-                const durationDays = pkg === 'weekly' ? 7 : 30;
-                await activatePremium(userId, durationDays);
-                logger.info(`Premium activated for ${userId}, ${durationDays}d`);
+            if (status.transaction_status === 'settlement' || status.transaction_status === 'capture') {
+                // Pembayaran sukses
+                const meta = notification.metadata || {};
+                const userId = meta.user_id;
+                const pkg = meta.package || 'monthly'; // default bulanan
+
+                if (userId) {
+                    const durationDays = pkg === 'weekly' ? 7 : 30;
+                    await activatePremium(userId, durationDays);
+                    logger.info(`Premium activated for ${userId}, ${durationDays}d (${pkg}) via Midtrans`);
+                }
+            } else if (status.transaction_status === 'expire') {
+                logger.info(`Transaction ${notification.order_id} expired`);
+            } else if (status.transaction_status === 'cancel') {
+                logger.info(`Transaction ${notification.order_id} cancelled`);
             }
         }
 
+        // Selalu balas 200 OK agar Midtrans tidak kirim ulang notifikasi
         res.status(200).json({ status: 'ok' });
     } catch (error) {
-        logger.error('Xendit webhook error:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        logger.error('Midtrans webhook error:', error);
+        // Tetap balas 200 agar tidak terjadi retry loop
+        res.status(200).json({ status: 'error', message: 'Internal Server Error' });
     }
 });
 
@@ -84,4 +95,20 @@ process.on('SIGTERM', async () => {
     process.exit(0);
 });
 
-app.listen(port, () => logger.info(`Yenni AI running on port ${port}`));
+// Tangkap uncaught exception agar container tidak mati total
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception:', {
+        message: error.message,
+        stack: error.stack
+    });
+    // Jangan exit, biarkan container tetap hidup
+});
+
+// Tangkap unhandled rejection
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+app.listen(port, () => {
+    logger.info(`Yenni AI running on port ${port}`);
+});
