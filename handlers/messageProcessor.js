@@ -234,20 +234,23 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
     await incrementTypeQuota(userId, quotaType);
 
     // 18. Reminder upgrade
-    if (!quota.isPremium) {
+   if (!quota.isPremium) {
         const remaining = await getAllRemaining(userId);
-        const total = (remaining.text > 0 ? 1 : 0) + (remaining.image > 0 ? 1 : 0) + (remaining.voice > 0 ? 1 : 0);
-        if (total === 0) {
-            responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni Premium biar unlimited. Ketik /upgrade atau /bayar ~';
-        } else {
-            const parts = [];
-            if (remaining.text > 0) parts.push(`${remaining.text} teks`);
-            if (remaining.image > 0) parts.push(`${remaining.image} gambar`);
-            if (remaining.voice > 0) parts.push(`${remaining.voice} voice`);
-            responseText += `\n\n💡 Kuota hari ini: ${parts.join(', ')}. Ketik /upgrade untuk langganan biar unlimited~`;
+        const totalRemaining = remaining.text + remaining.image + remaining.voice;
+
+        // Hanya tampilkan jika total sisa kuota ≤ 3 (hampir habis)
+        if (totalRemaining <= 3) {
+            if (totalRemaining === 0) {
+                responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni Premium biar unlimited. Ketik /upgrade atau /bayar ~';
+            } else {
+                const parts = [];
+                if (remaining.text > 0) parts.push(`${remaining.text} teks`);
+                if (remaining.image > 0) parts.push(`${remaining.image} gambar`);
+                if (remaining.voice > 0) parts.push(`${remaining.voice} voice`);
+                responseText += `\n\n💡 Kuota hampir habis: ${parts.join(', ')}. Ketik /upgrade untuk langganan biar unlimited~`;
+            }
         }
     }
-
     return { text: responseText, images };
 }
 
