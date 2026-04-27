@@ -10,20 +10,11 @@ const { createSubscription } = require('../services/xendit');
 const axios = require('axios');
 const logger = require('../utils/logger');
 
-const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
-const WA_ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN;
-const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;
-const WA_API_VERSION = 'v22.0';
-const WA_API_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}/messages`;
+const WA_API_URL = `https://graph.facebook.com/v22.0/${process.env.WA_PHONE_NUMBER_ID}/messages`;
 
 function verifyWebhook(req, res) {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-    if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) {
-        logger.info('WhatsApp webhook verified');
-        return res.status(200).send(challenge);
-    }
+    const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
+    if (mode === 'subscribe' && token === process.env.WA_VERIFY_TOKEN) return res.status(200).send(challenge);
     return res.sendStatus(403);
 }
 
@@ -31,13 +22,10 @@ async function handleWebhook(req, res) {
     try {
         const body = req.body;
         if (!body.object || !body.entry) return res.sendStatus(400);
-
         for (const entry of body.entry) {
             for (const change of entry.changes || []) {
                 if (change.field !== 'messages') continue;
-                const value = change.value || {};
-                const messages = value.messages || [];
-                for (const msg of messages) {
+                for (const msg of (change.value || {}).messages || []) {
                     await processIncomingMessage(msg);
                 }
             }
@@ -52,227 +40,152 @@ async function handleWebhook(req, res) {
 async function processIncomingMessage(msg) {
     const from = msg.from;
     const userId = `whatsapp:${from}`;
-    const msgType = msg.type;
-
     let session = await getSession(userId);
     let user = await getUser(userId);
 
-    // ===== TEXT =====
-    if (msgType === 'text') {
-        const messageText = msg.text?.body || '';
-        const lowerText = messageText.toLowerCase().trim();
-
-        // Perintah khusus
-        if (lowerText === 'ganti level' || lowerText === '/ganti_level') {
-            if (!user) return sendTextMessage(from, 'Ketik "halo" dulu ya, Kak.');
-            session.level = null; session.subLevel = null;
-            await saveSession(userId, session);
-            return sendTextMessage(from, `🔁 Kakak mau pindah ke jenjang mana?\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\nBalas dengan angka ya.`);
-        }
-
-        if (lowerText === 'upgrade' || lowerText === '/upgrade') {
-            if (!user) return sendTextMessage(from, 'Ketik "halo" dulu ya, Kak.');
-            const premium = await isPremium(userId);
-            if (premium) return sendTextMessage(from, '✨ Kakak sudah premium!');
-            return sendTextMessage(from, `🚀 *Yenni Premium*\n- Mingguan: Rp12.000/7 hari\n- Bulanan: Rp35.000/30 hari\nKetik "bayar mingguan" atau "bayar bulanan" untuk lanjut.`);
-        }
-
-        if (lowerText === 'bayar mingguan' || lowerText === 'bayar bulanan') {
-            if (!user) return sendTextMessage(from, 'Ketik "halo" dulu ya, Kak.');
-            const premium = await isPremium(userId);
-            if (premium) return sendTextMessage(from, '✨ Kakak sudah premium!');
-            const pkgKey = lowerText.includes('mingguan') ? 'weekly' : 'monthly';
-            try {
-                const invoice = await createSubscription(userId, pkgKey, '');
-                return sendTextMessage(from, `💳 Bayar via link ini:\n${invoice.payment_link_url}\n\nSetelah bayar, premium otomatis aktif.`);
-            } catch (e) {
-                logger.error('Payment error:', e);
-                return sendTextMessage(from, '😔 Gagal membuat pembayaran. Coba lagi nanti.');
-            }
-        }
-
-        if (lowerText === 'status' || lowerText === '/status') {
-            if (!user) return sendTextMessage(from, 'Ketik "halo" dulu ya, Kak.');
-            const premium = await isPremium(userId);
-            const remaining = await getRemainingChats(userId);
-            let txt = `📊 *Status Akun*\nJenjang: ${getUserLevelText(user.level, user.sub_level)}\nStatus: ${premium ? '✨ Premium' : '🆓 Gratis'}\n`;
-            if (!premium) txt += `Chat gratis hari ini: ${remaining}/10\n`;
-            return sendTextMessage(from, txt);
-        }
-
-        // Onboarding
+    if (msg.type === 'text') {
+        const text = (msg.text?.body || '').trim();
         if (!user || !session?.level) {
             if (!session) session = { level: null, subLevel: null, history: [] };
-            const choice = messageText.trim();
-            if (['1','2','3','4','5'].includes(choice)) {
+            if (['1','2','3','4','5'].includes(text)) {
                 let level, subLevel;
-                if (choice === '1') { level = 'sd-smp'; subLevel = 'sd-1-3'; }
-                else if (choice === '2') { level = 'sd-smp'; subLevel = 'sd-4-6'; }
-                else if (choice === '3') { level = 'sd-smp'; subLevel = 'smp'; }
-                else if (choice === '4') { level = 'sma-smk'; subLevel = 'sma'; }
-                else if (choice === '5') { level = 'sma-smk'; subLevel = 'smk'; }
-
-                if (!user) await createUser(userId, 'whatsapp', level, subLevel);
-                else await updateUserLevel(userId, level, subLevel);
+                if (text==='1') { level='sd-smp'; subLevel='sd-1-3'; }
+                else if (text==='2') { level='sd-smp'; subLevel='sd-4-6'; }
+                else if (text==='3') { level='sd-smp'; subLevel='smp'; }
+                else if (text==='4') { level='sma-smk'; subLevel='sma'; }
+                else { level='sma-smk'; subLevel='smk'; }
+                if (!user) await createUser(userId,'whatsapp',level,subLevel);
+                else await updateUserLevel(userId,level,subLevel);
                 session = { level, subLevel, history: [] };
                 await saveSession(userId, session);
-                return sendTextMessage(from, `✅ Terdaftar sebagai ${getUserLevelText(level, subLevel)}. Tanya apa saja!`);
+                return sendText(from,`✅ Siap! Kamu terdaftar sebagai siswa ${getWAlevel(level,subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
             }
-            return sendTextMessage(from, `👋 Halo! Aku Yenni. Pilih jenjang:\n1️⃣ SD 1-3\n2️⃣ SD 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK`);
+            return sendText(from,`👋 Halo! Aku Yenni, asisten belajar AI.\nPilih jenjang pendidikanmu dulu yuk:\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\n\nBalas dengan *angka* pilihanmu ya.`);
         }
-
-        // Proses pesan biasa
+        if (text === 'ganti level' || text === '/ganti_level') {
+            session.level = null; session.subLevel = null;
+            await saveSession(userId, session);
+            return sendText(from,`🔁 Kakak mau pindah ke jenjang mana?\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK`);
+        }
+        if (text === 'upgrade' || text === '/upgrade') {
+            const premium = await isPremium(userId);
+            if (premium) return sendText(from,'✨ Kakak sudah member Yenni Premium!');
+            return sendText(from,`🚀 Upgrade ke Yenni Premium\n\n- Mingguan: Rp12.000/7 hari\n- Bulanan: Rp35.000/30 hari\n\nBalas "bayar mingguan" atau "bayar bulanan"`);
+        }
+        if (text.startsWith('bayar')) {
+            const pkg = text.includes('mingguan') ? 'weekly' : 'monthly';
+            try {
+                const invoice = await createSubscription(userId, pkg);
+                return sendText(from,`💳 Link pembayaran:\n${invoice.payment_link_url}`);
+            } catch (e) { return sendText(from,'😔 Gangguan pembayaran. Coba lagi nanti.'); }
+        }
+        if (text === 'status' || text === '/status') {
+            const premium = await isPremium(userId);
+            if (premium) return sendText(from,'✨ Member Premium! Chat unlimited.');
+            const r = await getRemainingChats(userId);
+            return sendText(from,`📊 Sisa chat gratis hari ini: *${r}* dari 10`);
+        }
         try {
-            const result = await processMessage(userId, messageText, session, 'whatsapp');
-            await sendTextAndImages(from, result);
+            const result = await processMessage(userId, text, session, 'whatsapp');
+            await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
-            logger.error('WA text error:', error);
-            await sendTextMessage(from, '😔 Maaf, ada gangguan.');
+            logger.error('WA process error:', error);
+            await sendText(from,'😔 Maaf, ada gangguan. Coba lagi ya.');
         }
     }
-
-    // ===== IMAGE =====
-    else if (msgType === 'image') {
-        if (!user || !session?.level) return sendTextMessage(from, 'Pilih jenjang dulu ya.');
+    else if (msg.type === 'image') {
         try {
-            const image = msg.image || {};
-            const imageId = image.id;
-            const caption = image.caption || 'Jelaskan gambar ini.';
+            const imageId = (msg.image || {}).id;
+            const caption = (msg.image || {}).caption || 'Jelaskan gambar ini.';
             const imageUrl = await getMediaUrl(imageId);
             const imageBuffer = await downloadFile(imageUrl);
-
-            let compressed;
-            try { compressed = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 }); }
-            catch { compressed = imageBuffer; }
-
+            let compressed; try { compressed = await compressImage(imageBuffer,{maxWidth:1024,quality:80}); } catch { compressed = imageBuffer; }
+            const extractedText = await extractTextFromImage(compressed);
             const result = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', compressed);
-            await sendTextAndImages(from, result);
+            await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA image error:', error);
-            await sendTextMessage(from, '😔 Gagal memproses gambar.');
+            await sendText(from,'😔 Gambar tidak bisa diproses.');
         }
     }
-
-    // ===== VOICE =====
-    else if (msgType === 'audio' || msgType === 'voice') {
-        if (!user || !session?.level) return sendTextMessage(from, 'Pilih jenjang dulu ya.');
+    else if (msg.type === 'audio' || msg.type === 'voice') {
         try {
-            const audio = msg.audio || msg.voice || {};
-            const audioId = audio.id;
+            const audioId = (msg.audio || msg.voice || {}).id;
             const audioUrl = await getMediaUrl(audioId);
-            const resp = await axios.get(audioUrl, { responseType: 'arraybuffer' });
+            const resp = await axios.get(audioUrl,{responseType:'arraybuffer'});
             const audioBuffer = Buffer.from(resp.data);
-
-            await sendTextMessage(from, '🎤 Yenni dengerin...');
-            const transcribed = await transcribeAudio(audioBuffer, 'audio/ogg');
-            if (!transcribed) return sendTextMessage(from, '🎤 Tidak terdengar. Ulangi lagi ya.');
-
-            await sendTextMessage(from, `📝 Yenni dengar: "${transcribed}"`);
+            await sendText(from,'🎤 Yenni dengerin suara Kakak...');
+            const transcribed = await transcribeAudio(audioBuffer,'audio/ogg');
+            if (!transcribed) return sendText(from,'🎤 Maaf, tidak bisa mendengar.');
+            await sendText(from,`📝 Yenni dengar: "${transcribed}"`);
             const result = await processMessage(userId, transcribed, session, 'whatsapp');
-            await sendTextAndImages(from, result);
+            await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA voice error:', error);
-            await sendTextMessage(from, '🎤 Gagal memproses suara.');
+            await sendText(from,'🎤 Suara tidak bisa diproses.');
         }
     }
-
-    // ===== DOCUMENT (PDF) =====
-    else if (msgType === 'document') {
-        if (!user || !session?.level) return sendTextMessage(from, 'Pilih jenjang dulu ya.');
+    else if (msg.type === 'document') {
         try {
             const doc = msg.document || {};
-            const docId = doc.id;
-            const filename = doc.filename || '';
-            if (!filename.toLowerCase().endsWith('.pdf')) {
-                return sendTextMessage(from, '📎 Hanya file PDF yang bisa dibaca.');
-            }
-            const docUrl = await getMediaUrl(docId);
+            if (!(doc.filename||'').toLowerCase().endsWith('.pdf')) return sendText(from,'📎 Yenni hanya bisa baca PDF.');
+            const docUrl = await getMediaUrl(doc.id);
             const docBuffer = await downloadFile(docUrl);
-            const pdfText = await extractTextFromPDF(docBuffer);
-            if (!pdfText) return sendTextMessage(from, '📄 PDF ini hasil scan, kirim sebagai gambar saja ya.');
-            const caption = doc.caption || 'Jelaskan isi PDF ini.';
-            const result = await processMessage(userId, `[PDF_TEXT]${caption}\n${pdfText}`, session, 'whatsapp');
-            await sendTextAndImages(from, result);
+            let pdfText; try { pdfText = await extractTextFromPDF(docBuffer); } catch { return sendText(from,'Gagal membaca PDF.'); }
+            if (!pdfText) return sendText(from,'📄 PDF ini hasil scan. Kirim fotonya langsung sebagai gambar ya.');
+            const result = await processMessage(userId, `[PDF_TEXT]${doc.caption||'Jelaskan isi PDF ini.'}\n${pdfText}`, session, 'whatsapp');
+            await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA doc error:', error);
-            await sendTextMessage(from, '😔 Gagal memproses dokumen.');
+            await sendText(from,'😔 Dokumen tidak bisa diproses.');
         }
     }
 }
 
-async function sendTextAndImages(to, result) {
-    if (result.text) {
-        if (result.text.length > 1500) {
-            const chunks = splitMessage(result.text, 1500);
-            for (const chunk of chunks) await sendTextMessage(to, chunk);
-        } else {
-            await sendTextMessage(to, result.text);
-        }
-    }
-    for (const url of result.images || []) {
-        try { await sendImageMessage(to, url); } catch {}
-    }
-}
-
-async function sendTextMessage(to, text) {
+async function sendText(to, text) {
     try {
         await axios.post(WA_API_URL, {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to,
-            type: 'text',
-            text: { body: text, preview_url: false }
-        }, { headers: { Authorization: `Bearer ${WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
-    } catch (error) {
-        logger.error('Send WA text error:', error.response?.data || error.message);
-    }
+            messaging_product: 'whatsapp', recipient_type: 'individual', to,
+            type: 'text', text: { body: text, preview_url: false }
+        }, { headers: { 'Authorization': `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+    } catch (error) { logger.error('WA send text error:', error.response?.data || error.message); }
 }
 
-async function sendImageMessage(to, imageUrl) {
+async function sendImage(to, url) {
     try {
         await axios.post(WA_API_URL, {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to,
-            type: 'image',
-            image: { link: imageUrl }
-        }, { headers: { Authorization: `Bearer ${WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
-    } catch (error) {
-        logger.error('Send WA image error:', error.response?.data || error.message);
-    }
+            messaging_product: 'whatsapp', recipient_type: 'individual', to,
+            type: 'image', image: { link: url, caption: '📊 Visualisasi' }
+        }, { headers: { 'Authorization': `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+    } catch (error) { logger.error('WA send image error:', error.response?.data || error.message); }
+}
+
+async function sendLongTextWA(to, text, images) {
+    if (text.length > 1500) {
+        for (const chunk of splitWA(text, 1500)) await sendText(to, chunk);
+    } else await sendText(to, text);
+    for (const url of images) { try { await sendImage(to, url); } catch (e) {} }
 }
 
 async function getMediaUrl(mediaId) {
-    const resp = await axios.get(`https://graph.facebook.com/${WA_API_VERSION}/${mediaId}`, {
-        headers: { Authorization: `Bearer ${WA_ACCESS_TOKEN}` }
+    const resp = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+        headers: { 'Authorization': `Bearer ${process.env.WA_ACCESS_TOKEN}` }
     });
     return resp.data.url;
 }
 
-function splitMessage(text, maxLength) {
-    const chunks = [];
-    let current = '';
-    const words = text.split(' ');
-    for (const word of words) {
-        if ((current + ' ' + word).length > maxLength) {
-            chunks.push(current.trim());
-            current = word;
-        } else {
-            current += (current ? ' ' : '') + word;
-        }
+function splitWA(text, max) {
+    const chunks = []; let cur = '';
+    for (const w of text.split(' ')) {
+        if ((cur + ' ' + w).length > max) { chunks.push(cur.trim()); cur = w; }
+        else cur += (cur ? ' ' : '') + w;
     }
-    if (current) chunks.push(current.trim());
+    if (cur) chunks.push(cur.trim());
     return chunks;
 }
 
-function getUserLevelText(level, subLevel) {
-    const map = {
-        'sd-1-3': 'SD Kelas 1-3',
-        'sd-4-6': 'SD Kelas 4-6',
-        'smp': 'SMP',
-        'sma': 'SMA',
-        'smk': 'SMK'
-    };
+function getWAlevel(level, subLevel) {
+    const map = { 'sd-1-3':'SD Kelas 1-3','sd-4-6':'SD Kelas 4-6','smp':'SMP','sma':'SMA','smk':'SMK' };
     return map[subLevel] || level;
 }
 
