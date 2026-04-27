@@ -6,7 +6,7 @@ const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor')
 const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
 const { isPremium, checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
-const { createSubscription } = require('../services/xendit');
+const { createPaymentLink, PACKAGES } = require('../services/midtrans');
 const axios = require('axios');
 const logger = require('../utils/logger');
 
@@ -74,8 +74,13 @@ async function processIncomingMessage(msg) {
         if (text.startsWith('bayar')) {
             const pkg = text.includes('mingguan') ? 'weekly' : 'monthly';
             try {
-                const invoice = await createSubscription(userId, pkg);
-                return sendText(from, `💳 Link pembayaran:\n${invoice.payment_link_url}`);
+                const invoice = await createPaymentLink(userId, pkg);
+                return sendText(from,
+                    `💳 Pembayaran Yenni Premium (${PACKAGES[pkg].name})\n\n` +
+                    `Klik link untuk membayar:\n${invoice.payment_link_url}\n\n` +
+                    `QRIS dan semua metode pembayaran tersedia.\n` +
+                    `Premium aktif otomatis setelah pembayaran.`
+                );
             } catch (e) { return sendText(from, '😔 Gangguan pembayaran. Coba lagi nanti.'); }
         }
         if (text === 'status') {
