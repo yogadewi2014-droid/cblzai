@@ -12,7 +12,7 @@ function initRedis() {
         });
         logger.info('Upstash Redis initialized');
     } else {
-        logger.warn('No Redis config, using in-memory Map fallback');
+        logger.warn('No Redis config, using Map fallback');
         global.sessionStore = new Map();
     }
 }
@@ -22,10 +22,8 @@ async function getSession(userId) {
         const data = await redis.get(`session:${userId}`);
         if (!data) return null;
         try {
-            if (typeof data === 'object') return data;
-            return JSON.parse(data);
-        } catch (e) {
-            logger.error('Invalid session JSON, resetting:', e.message);
+            return (typeof data === 'object') ? data : JSON.parse(data);
+        } catch {
             await redis.del(`session:${userId}`);
             return null;
         }
@@ -33,22 +31,16 @@ async function getSession(userId) {
     return global.sessionStore?.get(userId) || null;
 }
 
-async function saveSession(userId, sessionData, ttlSeconds = 86400) {
+async function saveSession(userId, data, ttl = 86400) {
     if (redis) {
-        await redis.set(`session:${userId}`, JSON.stringify(sessionData), { ex: ttlSeconds });
+        await redis.set(`session:${userId}`, JSON.stringify(data), { ex: ttl });
     } else {
-        global.sessionStore?.set(userId, sessionData);
+        global.sessionStore?.set(userId, data);
     }
 }
 
 async function closeRedis() {
-    // Upstash Redis REST API tidak memerlukan quit()
-    logger.info('Redis connection closed (no-op for REST)');
+    if (redis) logger.info('Redis closed (no-op for REST)');
 }
 
-module.exports = {
-    initRedis,
-    getSession,
-    saveSession,
-    closeRedis
-};
+module.exports = { initRedis, getSession, saveSession, closeRedis };
