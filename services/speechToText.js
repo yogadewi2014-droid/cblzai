@@ -1,27 +1,54 @@
-const OpenAI = require('openai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const config = require('../config');
 const logger = require('../utils/logger');
 
-const openai = new OpenAI({ apiKey: config.openaiApiKey });
+const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
+/**
+ * Transkripsi audio menggunakan Gemini 2.5 Flash Lite (multimodal)
+ * Model ini bisa langsung memproses audio dan mengembalikan teks.
+ * Biaya dihitung per token input audio, bukan per menit.
+ * @param {Buffer} audioBuffer - Buffer audio (ogg/mp3/wav/webm)
+ * @param {string} mimeType - MIME type audio (contoh: 'audio/ogg')
+ * @returns {Promise<string>} Teks hasil transkripsi
+ */
 async function transcribeAudio(audioBuffer, mimeType = 'audio/ogg') {
     try {
-        const extension = mimeType.includes('ogg') ? 'ogg' :
-                         mimeType.includes('mp3') ? 'mp3' :
-                         mimeType.includes('wav') ? 'wav' : 'ogg';
-        const file = new File([audioBuffer], `audio.${extension}`, { type: mimeType });
+        // Konversi buffer ke base64
+        const base64Audio = audioBuffer.toString('base64');
 
-        const transcription = await openai.audio.transcriptions.create({
-            model: 'gpt-4o-mini-transcribe',
-            file,
-            language: 'id',          // wajib
-            response_format: 'text'  // opsional, lebih ringan
+        // Siapkan model Gemini multimodal
+        const model = genAI.getGenerativeModel({
+            model: config.geminiModel, // 'gemini-2.5-flash-lite'
         });
 
-        logger.info(`Transcribed: "${transcription.substring(0, 50)}..."`);
-        return transcription;
+        // Kirim audio + prompt transkripsi
+        const result = await model.generateContent([
+            {
+                inlineData: {
+                    mimeType: mimeType,
+                    data: base64Audio,
+                },
+            },
+            {
+                text: 'Tolong transkripsi audio ini ke teks. Jika audio kosong atau hanya berisi noise, jawab dengan "[AUDIO_KOSONG]".',
+            },
+        ]);
+
+        const response = result.response;
+        const text = response.text().trim();
+
+        // Deteksi audio kosong
+        if (!text || text === '[AUDIO_KOSONG]' || text.length === 0) {
+            logger.info('Gemini returned empty transcription (silent/noise audio)');
+            return ''; // Kembalikan string kosong
+        }
+
+        logger.info(`Gemini transcribed: "${text.substring(0, 50)}..."`);
+        return text;
+
     } catch (error) {
-        logger.error('Transcribe error:', error);
+        logger.error('Gemini transcribe error:', error);
         throw new Error('TRANSCRIBE_FAILED: ' + error.message);
     }
 }
