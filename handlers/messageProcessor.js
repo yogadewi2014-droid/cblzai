@@ -233,7 +233,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         const totalRemaining = remaining.text + remaining.image + remaining.voice;
         if (totalRemaining <= 3) {
             if (totalRemaining === 0) {
-                responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni Premium biar unlimited. Ketik /upgrade atau /bayar ~';
+                responseText += '\n\n⚠️ *Semua kuota gratis kakak untuk hari ini sudah habis!* Yuk upgrade ke Yenni Premium biar unlimited. Ketik /upgrade atau /bayar ~';
             } else {
                 const parts = [];
                 if (remaining.text > 0) parts.push(`${remaining.text} teks`);
