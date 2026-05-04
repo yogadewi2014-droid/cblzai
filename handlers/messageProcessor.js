@@ -14,7 +14,7 @@ const { userRateLimit, checkTokenQuota, isDuplicateRequest } = require('../middl
 const { generateLatexUrl, generateChartUrl } = require('../services/visualization');
 const { countTokens } = require('../utils/tokenCounter');
 const { isSimpleMath, isMediumMath, isHardReasoning } = require('../utils/router');
-const { checkTypeQuota, incrementTypeQuota, getAllRemaining, getUserTier } = require('../services/quotaManager');
+const { consumeQuota, getAllRemaining, getUserTier } = require('../services/quotaManager');
 const { routeModel } = require('../services/modelRouter');
 const logger = require('../utils/logger');
 const config = require('../config');
@@ -30,13 +30,13 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
 
     const subLevel = session.subLevel || (session.level === 'sd-smp' ? 'smp' : 'sma');
 
-    // 2. Tentukan jenis kuota
+    // 2. Tentukan jenis kuota dan konsumsi langsung (atomic)
     let quotaType = 'text';
     if (message.startsWith('[IMAGE]') || message.startsWith('[IMAGE_BUFFER]')) {
         quotaType = 'image';
     }
 
-    const quota = await checkTypeQuota(userId, quotaType);
+    const quota = await consumeQuota(userId, quotaType);
     if (!quota.allowed) {
         const tierName = quota.tier === 'free' ? 'gratis' : quota.tier.toUpperCase();
         return {
@@ -56,10 +56,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
     if (exactCached) {
         await saveConversation(userId, 'user', message);
         await saveConversation(userId, 'assistant', exactCached);
-        await incrementTypeQuota(userId, quotaType);
-        // Filter output untuk free tier
-        const tier = await getUserTier(userId);
-        return { text: exactCached, images: tier === 'free' ? [] : [] };
+        return { text: exactCached, images: [] };
     }
 
     if (!isMediaMessage) {
@@ -67,9 +64,7 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         if (semanticCached) {
             await saveConversation(userId, 'user', message);
             await saveConversation(userId, 'assistant', semanticCached);
-            await incrementTypeQuota(userId, quotaType);
-            const tier = await getUserTier(userId);
-            return { text: semanticCached, images: tier === 'free' ? [] : [] };
+            return { text: semanticCached, images: [] };
         }
     }
 
@@ -94,7 +89,6 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
         session.history.push({ role: 'user', content: originalMessage });
         session.history.push({ role: 'assistant', content: articleResponse });
         await saveSession(userId, session);
-        await incrementTypeQuota(userId, quotaType);
         return { text: articleResponse, images: [] };
     }
 
@@ -230,19 +224,13 @@ async function processMessage(userId, message, session, platform, imageBuffer = 
     await saveConversation(userId, 'user', originalMessage);
     await saveConversation(userId, 'assistant', responseText);
 
-    // 14. Kuota & reminder
-    await incrementTypeQuota(userId, quotaType);
+    // 14. Reminder upgrade (hanya free)
     if (userTier === 'free') {
         const remaining = await getAllRemaining(userId);
-        const totalRemaining = remaining.text + remaining.image + remaining.voice;
-        if (totalRemaining <= 3) {
-            if (totalRemaining === 0) {
-                responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni GO atau PRO biar unlimited. Ketik /upgrade ~';
-            } else {
-                const parts = [];
-                if (remaining.text > 0) parts.push(`${remaining.text} teks`);
-                responseText += `\n\n💡 Kuota hampir habis: ${parts.join(', ')}. Ketik /upgrade untuk langganan biar unlimited~`;
-            }
+        if (remaining.text === 0 && remaining.image === 0 && remaining.voice === 0) {
+            responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni GO atau PRO. Ketik /upgrade ~';
+        } else if (remaining.text <= 3) {
+            responseText += `\n\n💡 Sisa ${remaining.text} teks. Ketik /upgrade untuk langganan biar unlimited~`;
         }
     }
 
