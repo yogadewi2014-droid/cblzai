@@ -4,72 +4,172 @@ const logger = require('../utils/logger');
 
 let redis;
 if (config.upstashRedisUrl && config.upstashRedisToken) {
-    redis = new Redis({ url: config.upstashRedisUrl, token: config.upstashRedisToken });
+    redis = new Redis({
+        url: config.upstashRedisUrl,
+        token: config.upstashRedisToken
+    });
 }
 
+// ======================
+// LIMIT CONFIG
+// ======================
 const LIMITS = {
-    text: 10,
-    image: 3,
-    voice: 5
+    free: { text: 10, image: 0, voice: 0, ffmpeg: 0 },
+    go:   { text: 75, image: 5, voice: 20, ffmpeg: 10 },
+    pro:  { text: 150, image: 10, voice: 50, ffmpeg: 30 }
 };
 
-async function isPremium(userId) {
-    if (!redis) return false;
-    const status = await redis.get(`premium:${userId}`);
-    return status === 'active';
+// ======================
+// HELPER: LOCAL DATE (BALI)
+// ======================
+function getLocalDate() {
+    return new Date().toLocaleDateString('en-CA', {
+        timeZone: 'Asia/Makassar'
+    });
 }
 
-async function activatePremium(userId, durationDays = 30) {
+// ======================
+// USER TIER
+// ======================
+async function getUserTier(userId) {
+    if (!redis) return 'free';
+    const tier = await redis.get(`tier:${userId}`);
+    return tier || 'free';
+}
+
+async function setUserTier(userId, tier, durationDays = 30) {
     if (!redis) return;
-    await redis.set(`premium:${userId}`, 'active', { ex: durationDays * 86400 });
-    logger.info(`Premium activated for ${userId}, ${durationDays} days`);
+
+    await redis.set(`tier:${userId}`, tier, {
+        ex: durationDays * 86400
+    });
+
+    logger.info(`Tier ${tier} activated for ${userId}, ${durationDays}d`);
 }
 
-function getQuotaKey(userId, type) {
-    const today = new Date().toISOString().slice(0, 10);
-    return `quota:${userId}:${type}:${today}`;
-}
+// ======================
+// ATOMIC QUOTA CONSUME (ANTI JEBOL)
+// ======================
+async function consumeQuota(userId, type) {
+    if (!redis) {
+        return {
+            allowed: false,
+            remaining: 0,
+            tier: 'free',
+            error: 'redis_down'
+        };
+    }
 
-async function checkTypeQuota(userId, type) {
-    if (!redis) return { allowed: true, remaining: -1, isPremium: false };
-    const premium = await isPremium(userId);
-    if (premium) return { allowed: true, remaining: -1, isPremium: true };
-    const limit = LIMITS[type] || 10;
-    const key = getQuotaKey(userId, type);
-    const count = parseInt(await redis.get(key)) || 0;
+    const tier = await getUserTier(userId);
+    const limit = (LIMITS[tier] || LIMITS['free'])[type] || 0;
+
+    if (limit === 0) {
+        return { allowed: false, remaining: 0, tier, limit };
+    }
+
+    const today = getLocalDate();
+    const key = `quota:${userId}:${type}:${today}`;
+
+    // atomic increment
+    const count = await redis.incr(key);
+
+    // set TTL saat pertama kali
+    if (count === 1) {
+        const now = new Date();
+        const endOfDay = new Date(now);
+        endOfDay.setHours(24, 0, 0, 0);
+
+        const ttl = Math.floor((endOfDay - now) / 1000);
+        await redis.expire(key, ttl);
+    }
+
+    if (count > limit) {
+        return {
+            allowed: false,
+            remaining: 0,
+            tier,
+            limit
+        };
+    }
+
     return {
-        allowed: count < limit,
-        remaining: Math.max(0, limit - count),
-        isPremium: false,
+        allowed: true,
+        remaining: limit - count,
+        tier,
         limit
     };
 }
 
-async function incrementTypeQuota(userId, type) {
-    if (!redis) return;
-    const premium = await isPremium(userId);
-    if (premium) return;
-    const key = getQuotaKey(userId, type);
-    const count = await redis.incr(key);
-    if (count === 1) {
-        const now = new Date();
-        const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-        const ttl = Math.floor((endOfDay - now) / 1000);
-        await redis.expire(key, ttl);
+// ======================
+// CHECK ONLY (OPTIONAL)
+// ======================
+async function checkQuota(userId, type) {
+    if (!redis) {
+        return { allowed: false, remaining: 0, tier: 'free' };
     }
+
+    const tier = await getUserTier(userId);
+    const limit = (LIMITS[tier] || LIMITS['free'])[type] || 0;
+
+    if (limit === 0) {
+        return { allowed: false, remaining: 0, tier, limit };
+    }
+
+    const today = getLocalDate();
+    const count = parseInt(
+        await redis.get(`quota:${userId}:${type}:${today}`)
+    ) || 0;
+
+    return {
+        allowed: count < limit,
+        remaining: Math.max(0, limit - count),
+        tier,
+        limit
+    };
 }
 
+// ======================
+// GET ALL REMAINING
+// ======================
 async function getAllRemaining(userId) {
-    if (!redis) return { text: LIMITS.text, image: LIMITS.image, voice: LIMITS.voice };
-    const premium = await isPremium(userId);
-    if (premium) return { text: -1, image: -1, voice: -1 };
-    const result = {};
-    for (const t of Object.keys(LIMITS)) {
-        const key = getQuotaKey(userId, t);
-        const count = parseInt(await redis.get(key)) || 0;
-        result[t] = Math.max(0, LIMITS[t] - count);
+    if (!redis) {
+        return LIMITS.free;
     }
+
+    const tier = await getUserTier(userId);
+    const limits = LIMITS[tier] || LIMITS.free;
+
+    const today = getLocalDate();
+    const result = {};
+
+    for (const type of Object.keys(limits)) {
+        const count = parseInt(
+            await redis.get(`quota:${userId}:${type}:${today}`)
+        ) || 0;
+
+        result[type] = Math.max(0, limits[type] - count);
+    }
+
     return result;
 }
 
-module.exports = { isPremium, activatePremium, checkTypeQuota, incrementTypeQuota, getAllRemaining, LIMITS };
+// ======================
+// EXPORT
+// ======================
+module.exports = {
+    LIMITS,
+
+    getUserTier,
+    setUserTier,
+
+    consumeQuota,     // 🔥 utama (pakai ini)
+    checkQuota,       // opsional
+
+    getAllRemaining,
+
+    isPremium: async (userId) =>
+        (await getUserTier(userId)) !== 'free',
+
+    activatePremium: (userId, days = 30) =>
+        setUserTier(userId, 'go', days)
+};
