@@ -1,21 +1,35 @@
 const admin = require('firebase-admin');
 const { createClient } = require('@supabase/supabase-js');
+const OpenAI = require('openai');
 const logger = require('../utils/logger');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// 🔐 Tetap pakai ANON KEY
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+// 🤖 AI init
+const ai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 let fcmInitialized = false;
 
-/**
- * Inisialisasi Firebase Admin SDK
- */
+// =========================
+// INIT FCM
+// =========================
 function initFCM() {
   if (fcmInitialized) return;
+
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '{}');
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: process.env.FIREBASE_PROJECT_ID,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+        }),
+      });
+    }
     fcmInitialized = true;
     logger.info('FCM initialized');
   } catch (e) {
@@ -23,108 +37,187 @@ function initFCM() {
   }
 }
 
-/**
- * Daftarkan device token pengguna
- */
-async function registerDevice(userId, token, platform = 'telegram') {
+// =========================
+// AI FOLLOW-UP GENERATOR
+// =========================
+async function generateAIFollowup(userId, days) {
   try {
-    await supabase.from('device_tokens').upsert({
-      user_id: userId,
-      token,
-      platform,
-      updated_at: new Date().toISOString()
+    const [{ data: user }, { data: chats }, { data: summary }] = await Promise.all([
+      supabase.from('users').select('total_chats').eq('id', userId).single(),
+      supabase.from('conversations')
+        .select('content, role')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(3),
+      supabase.from('summaries')
+        .select('summary')
+        .eq('user_id', userId)
+        .maybeSingle()
+    ]);
+
+    const recent = (chats || [])
+      .filter(c => c.role === 'user')
+      .map(c => c.content)
+      .slice(0, 2)
+      .join(' | ');
+
+    const prompt = `
+Kamu adalah Yenni, asisten belajar.
+
+Buat 1 kalimat singkat, hangat, tidak kaku.
+
+User tidak aktif ${days} hari.
+Topik terakhir: ${recent}
+Ringkasan: ${summary?.summary || ''}
+Total chat: ${user?.total_chats || 0}
+
+Tujuan: ajak belajar lagi secara personal.
+`;
+
+    const res = await ai.chat.completions.create({
+      model: 'gpt-5-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
     });
-    logger.info(`Device registered: ${userId} (${platform})`);
-  } catch (error) {
-    logger.error('FCM registerDevice error:', error);
+
+    return res.choices?.[0]?.message?.content?.trim();
+
+  } catch (e) {
+    logger.error('AI error:', e.message);
+    return null;
   }
 }
 
-/**
- * Kirim notifikasi ke pengguna tertentu
- */
+// =========================
+// REGISTER DEVICE (RPC)
+// =========================
+async function registerDevice(userId, token, platform = 'unknown') {
+  try {
+    await supabase.rpc('register_device', {
+      uid: userId,
+      fcm_token: token,
+      platform
+    });
+    logger.info(`Device registered: ${userId}`);
+  } catch (error) {
+    logger.error('registerDevice error:', error);
+  }
+}
+
+// =========================
+// SEND NOTIFICATION
+// =========================
 async function sendNotification(userId, title, body, data = {}) {
   initFCM();
   if (!fcmInitialized) return;
 
   try {
-    const { data: tokens } = await supabase.from('device_tokens')
+    const { data: tokens } = await supabase
+      .from('device_tokens')
       .select('token')
       .eq('user_id', userId);
 
     if (!tokens || tokens.length === 0) return;
 
-    const message = {
+    const tokenList = tokens.map(t => t.token);
+
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens: tokenList,
       notification: { title, body },
       data
-    };
+    });
 
-    for (const t of tokens) {
-      try {
-        await admin.messaging().send({ ...message, token: t.token });
-        logger.info(`Notification sent to ${userId}`);
-      } catch (e) {
-        // Jika token invalid, hapus dari database
-        if (e.code === 'messaging/registration-token-not-registered') {
-          await supabase.from('device_tokens').delete().eq('token', t.token);
-          logger.info(`Invalid token removed for ${userId}`);
+    // cleanup token invalid
+    if (response.responses) {
+      for (let i = 0; i < response.responses.length; i++) {
+        if (!response.responses[i].success) {
+          const badToken = tokenList[i];
+          await supabase.rpc('delete_device_token', { tok: badToken });
         }
       }
     }
+
   } catch (error) {
-    logger.error('FCM sendNotification error:', error);
+    logger.error('sendNotification error:', error);
   }
 }
 
-/**
- * Kirim pengingat untuk pengguna tidak aktif
- */
-async function sendInactiveReminder(userId, daysInactive = 1) {
-  const messages = {
-    1: { title: '📚 Yenni Merindukanmu!', body: 'Sudah 24 jam nih kita nggak belajar bareng. Yuk, lanjut lagi! 🚀' },
-    7: { title: '💤 Udah Seminggu Nih...', body: 'Kamu udah 7 hari nggak mampir. Materi baru udah nungguin, lho! 📖' }
+// =========================
+// SEND REMINDER (AI + fallback + anti spam)
+// =========================
+async function sendInactiveReminder(userId, days) {
+  const fallback = {
+    1: '📚 Yenni merindukanmu! Yuk lanjut belajar lagi 🚀',
+    7: '💤 Sudah seminggu nih… Materi baru sudah menunggu! 📖'
   };
 
-  const { title, body } = messages[daysInactive] || messages[1];
-  await sendNotification(userId, title, body, {
-    type: 'inactive_reminder',
-    days_inactive: daysInactive.toString()
+  // anti spam
+  const { data: lastLog } = await supabase
+    .from('activity_logs')
+    .select('created_at')
+    .eq('user_id', userId)
+    .eq('event_type', `reminder_${days}d`)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (lastLog) {
+    const diffHours = (new Date() - new Date(lastLog.created_at)) / 36e5;
+    if ((days === 1 && diffHours < 24) || (days === 7 && diffHours < 168)) return;
+  }
+
+  // 🤖 AI message
+  let body = await generateAIFollowup(userId, days);
+
+  if (!body) body = fallback[days] || fallback[1];
+
+  await sendNotification(userId, 'Yenni AI', body, {
+    type: 'reminder',
+    days: String(days)
+  });
+
+  // log CRM
+  await supabase.from('activity_logs').insert({
+    user_id: userId,
+    event_type: `reminder_${days}d`,
+    metadata: { ai: !!body }
   });
 }
 
-/**
- * Jalankan pengecekan pengguna tidak aktif (via cron job)
- */
+// =========================
+// PROCESS USERS
+// =========================
 async function processInactiveUsers() {
   try {
-    const { data: users } = await supabase.from('users')
-      .select('id, last_active_at, tier')
+    const now = new Date();
+
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, last_active_at')
       .not('last_active_at', 'is', null);
 
     if (!users) return;
 
-    const now = new Date();
     for (const user of users) {
-      const lastActive = new Date(user.last_active_at);
-      const diffHours = (now - lastActive) / (1000 * 60 * 60);
+      const diffHours = (now - new Date(user.last_active_at)) / 36e5;
 
       if (diffHours >= 24 && diffHours < 48) {
         await sendInactiveReminder(user.id, 1);
-      } else if (diffHours >= 168) {
-        // 7 hari tidak aktif, kirim pengingat untuk semua tier
+      }
+
+      if (diffHours >= 168) {
         await sendInactiveReminder(user.id, 7);
       }
     }
-    logger.info('Inactive user processing completed');
-  } catch (error) {
-    logger.error('FCM processInactiveUsers error:', error);
+
+  } catch (e) {
+    logger.error('processInactiveUsers error:', e);
   }
 }
 
 module.exports = {
+  initFCM,
   registerDevice,
   sendNotification,
-  sendInactiveReminder,
-  processInactiveUsers,
-  initFCM
+  processInactiveUsers
 };
