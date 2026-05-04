@@ -1,8 +1,13 @@
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 const config = require('../config');
 const logger = require('../utils/logger');
 
-const supabase = createClient(config.supabaseUrl, config.supabaseAnonKey);
+const supabase = createClient(config.supabaseUrl, config.supabaseAnonKey, {
+    realtime: {
+        transport: WebSocket,
+    },
+});
 
 async function getUser(userId) {
     const { data, error } = await supabase
