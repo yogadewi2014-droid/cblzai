@@ -1,291 +1,287 @@
-const { getSession, saveSession } = require('../conversation/sessionManager');
-const { getUser, createUser, updateUserLevel } = require('../services/supabase');
-const { processMessage } = require('./messageProcessor');
-const { transcribeAudio } = require('../services/speechToText');
-const { getUserTier, consumeQuota, getAllRemaining } = require('../services/quotaManager');
-const { createPaymentLink, PACKAGES } = require('../services/midtrans');
-const { logActivity } = require('../services/crmService');  // ✅ CRM
-const axios = require('axios');
+const { callGemini } = require('../services/gemini');
+const { callOpenAI } = require('../services/openai');
+const { callDeepSeek } = require('../services/deepseek');
+const { searchAndSummarize } = require('../services/serper');
+const { extractTextFromImage } = require('../services/vision');
+const { downloadFile } = require('../utils/downloader');
+const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor');
+const { manageContext } = require('../conversation/contextCache');
+const { saveSession } = require('../conversation/sessionManager');
+const { saveConversation } = require('../services/supabase');
+const { buildSystemPrompt, buildArticlePrompt } = require('../services/promptBuilder');
+const { getExactMatchCache, setExactMatchCache, getSemanticCache, setSemanticCache } = require('../middleware/cacheHandler');
+const { userRateLimit, isDuplicateRequest } = require('../middleware/rateLimiter');
+const { generateLatexUrl, generateChartUrl } = require('../services/visualization');
+const { countTokens } = require('../utils/tokenCounter');
+const { isSimpleMath, isMediumMath, isHardReasoning } = require('../utils/router');
+const { consumeQuota, getAllRemaining, getUserTier, checkMediaQuota } = require('../services/quotaManager');
+const { routeModel } = require('../services/modelRouter');
+const { detectIntent } = require('../services/intentDetector');
+const { generateVoice, detectLanguage, selectVoice } = require('../services/voiceOutput');
+const { buildMedia } = require('../services/videoMaker');
+const { getImageUrl } = require('../services/imageSource');
 const logger = require('../utils/logger');
+const config = require('../config');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-function setupTelegramHandler(bot) {
+async function processMessage(userId, message, session, platform, imageBuffer = null) {
+    const originalMessage = message;
 
-    bot.start(async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        let user = await getUser(userId);
-        let session = await getSession(userId);
-        if (!user) {
-            session = { level: null, subLevel: null, history: [] };
-            await saveSession(userId, session);
-            // ✅ CATAT SIGN UP
-            await logActivity(userId, 'signup', { from: ctx.from.first_name });
-            return ctx.reply(
-                `👋 Halo! Aku Yenni, asisten belajar AI.\nPilih jenjang pendidikanmu dulu yuk:\n\n` +
-                `1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\n\n` +
-                `Balas dengan angka pilihanmu ya.`
-            );
+    // 1. Rate limit & deduplikasi
+    const allowed = await userRateLimit(userId);
+    if (!allowed) return { text: '⏳ Kakak sudah banyak bertanya. Yuk istirahat sebentar! 😊', images: [] };
+    const isDup = await isDuplicateRequest(userId, message);
+    if (isDup) return { text: '🐢 Kakak sudah kirim pertanyaan yang sama. Yenni sedang memproses...', images: [] };
+
+    const subLevel = session.subLevel || (session.level === 'sd-smp' ? 'smp' : 'sma');
+
+    // 2. Tentukan jenis kuota dan konsumsi langsung (atomic)
+    let quotaType = 'text';
+    if (message.startsWith('[IMAGE]') || message.startsWith('[IMAGE_BUFFER]')) {
+        quotaType = 'image';
+    }
+
+    const quota = await consumeQuota(userId, quotaType);
+    if (!quota.allowed) {
+        const tierName = quota.tier === 'free' ? 'gratis' : quota.tier.toUpperCase();
+        return {
+            text: `📊 *Kuota harian ${quotaType} Kakak sudah habis!*\n\n` +
+                  `Tier saat ini: ${tierName}\n` +
+                  `Yuk upgrade ke paket yang lebih tinggi supaya bisa belajar sepuasnya! 🚀\n\n` +
+                  `Ketik */upgrade* untuk lihat pilihan paket.`,
+            images: []
+        };
+    }
+
+    // 3. Cek cache
+    const isMediaMessage = message.startsWith('[IMAGE]') || message.startsWith('[IMAGE_BUFFER]') ||
+                           message.startsWith('[PDF]') || message.startsWith('[PDF_TEXT]');
+
+    const exactCached = await getExactMatchCache(message, session.level, subLevel);
+    if (exactCached) {
+        await saveConversation(userId, 'user', message);
+        await saveConversation(userId, 'assistant', exactCached);
+        return { text: exactCached, images: [] };
+    }
+
+    if (!isMediaMessage) {
+        const semanticCached = await getSemanticCache(message, session.level, subLevel);
+        if (semanticCached) {
+            await saveConversation(userId, 'user', message);
+            await saveConversation(userId, 'assistant', semanticCached);
+            return { text: semanticCached, images: [] };
         }
-        session = session || { level: user.level, subLevel: user.sub_level, history: [] };
-        delete session.upgrade_pending;
+    }
+
+    // 4. Follow-up singkat
+    if (message.match(/^(mau|ya|lanjut|oke|sip|yes|lanjutkan|boleh)$/i)) {
+        const lastAssistantMsg = session.history?.filter(m => m.role === 'assistant').pop();
+        if (lastAssistantMsg?.content) {
+            message = `[User setuju dengan tawaran: "${lastAssistantMsg.content}"]`;
+        }
+    }
+
+    // 5. Artikel
+    const articleMatch = message.match(/buat(?:kan)?\s+artikel\s+(?:tentang\s+)?(.+)/i);
+    if (articleMatch) {
+        const topic = articleMatch[1];
+        const articlePrompt = buildArticlePrompt(topic, session);
+        const articleResponse = await callOpenAI(articlePrompt, { max_tokens: config.wordLimits[subLevel].article * 2 });
+        await setExactMatchCache(originalMessage, session.level, subLevel, articleResponse);
+        await setSemanticCache(originalMessage, session.level, subLevel, articleResponse);
+        await saveConversation(userId, 'user', originalMessage);
+        await saveConversation(userId, 'assistant', articleResponse);
+        session.history.push({ role: 'user', content: originalMessage });
+        session.history.push({ role: 'assistant', content: articleResponse });
         await saveSession(userId, session);
-        const levelText = getUserLevelText(user.level, user.sub_level);
-        // ✅ CATAT LOGIN
-        await logActivity(userId, 'login');
-        await ctx.reply(`Halo lagi, Kak ${ctx.from.first_name || ''}! 👋\nKamu terdaftar sebagai siswa ${levelText}. Ada yang bisa Yenni bantu?`);
-    });
+        return { text: articleResponse, images: [] };
+    }
 
-    bot.command('ganti_level', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const session = await getSession(userId);
-        const user = await getUser(userId);
-        if (!user) return ctx.reply('Kakak belum terdaftar. Ketik /start dulu ya.');
-        session.level = null; session.subLevel = null;
-        delete session.upgrade_pending;
-        await saveSession(userId, session);
-        await logActivity(userId, 'change_level');  // ✅
-        return ctx.reply(`🔁 Kakak mau pindah ke jenjang mana nih?\n\n1️⃣ SD 1-3\n2️⃣ SD 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK`);
-    });
+    // 6. OCR & PDF
+    let extractedText = '';
+    if (message.startsWith('[IMAGE]') && !message.startsWith('[IMAGE_BUFFER]')) {
+        const imagePart = message.substring(7);
+        const newlineIndex = imagePart.indexOf('\n');
+        const imageUrl = newlineIndex > -1 ? imagePart.substring(0, newlineIndex).trim() : imagePart.trim();
+        const caption = newlineIndex > -1 ? imagePart.substring(newlineIndex + 1).trim() : '';
+        let buffer;
+        try { buffer = await downloadFile(imageUrl); } 
+        catch (e) { logger.error('Download image failed:', e); throw new Error('DOWNLOAD_FAILED: ' + e.message); }
+        try { buffer = await compressImage(buffer, { maxWidth: 1024, quality: 80 }); } 
+        catch (e) { logger.warn('Compression failed, using original:', e); }
+        try { extractedText = await extractTextFromImage(buffer); } 
+        catch (e) { logger.error('OCR failed:', e); throw new Error('OCR_FAILED: ' + e.message); }
+        message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan gambar ini.'}`;
+    }
 
-    bot.command('upgrade', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const user = await getUser(userId);
-        if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
-        const tier = await getUserTier(userId);
-        if (tier === 'pro') return ctx.reply('✨ Kakak sudah menjadi member Yenni PRO! Akses semua fitur tanpa batas.');
-        if (tier === 'go') {
-            let session = await getSession(userId);
-            session.upgrade_pending = true;
-            session.upgrade_from = 'go';
-            await saveSession(userId, session);
-            await logActivity(userId, 'upgrade_view', { current_tier: 'go' });  // ✅
-            return ctx.reply(
-                `🚀 *Upgrade ke PRO*\n\n` +
-                `Kakak saat ini di paket GO. Upgrade ke PRO untuk dapatkan:\n` +
-                `✅ Teks 150/hari + Voice 50/hari + Video 30/hari\n` +
-                `✅ Model AI reasoning (DeepSeek)\n` +
-                `✅ Progress tracking\n\n` +
-                `Harga: Rp75.000/bulan\n\n` +
-                `Balas *2* untuk upgrade ke PRO ya~`
-            );
+    if (message.startsWith('[IMAGE_BUFFER]')) {
+        const caption = message.substring(13).trim() || 'Jelaskan gambar ini.';
+        if (!imageBuffer) throw new Error('No image buffer provided');
+        let compressedBuffer;
+        try { compressedBuffer = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 }); } 
+        catch (e) { logger.warn('Compression failed, using original:', e); compressedBuffer = imageBuffer; }
+        try { extractedText = await extractTextFromImage(compressedBuffer); } 
+        catch (e) { logger.error('OCR failed:', e); throw new Error('OCR_FAILED: ' + e.message); }
+        message = `[Hasil OCR Gambar]:\n${extractedText}\n\nPertanyaan pengguna: ${caption}`;
+    }
+
+    if (message.startsWith('[PDF]')) {
+        const pdfPart = message.substring(5);
+        const newlineIndex = pdfPart.indexOf('\n');
+        const pdfUrl = newlineIndex > -1 ? pdfPart.substring(0, newlineIndex).trim() : pdfPart.trim();
+        const caption = newlineIndex > -1 ? pdfPart.substring(newlineIndex + 1).trim() : '';
+        let pdfBuffer;
+        try { pdfBuffer = await downloadFile(pdfUrl); } 
+        catch (e) { logger.error('Download PDF failed:', e); throw new Error('DOWNLOAD_FAILED: ' + e.message); }
+        let pdfText;
+        try { pdfText = await extractTextFromPDF(pdfBuffer); } 
+        catch (e) { logger.error('PDF extraction failed:', e); throw new Error('PDF_EXTRACT_FAILED: ' + e.message); }
+        if (!pdfText || pdfText.trim().length === 0) {
+            return { text: '📄 PDF ini sepertinya hasil scan. Kirim fotonya sebagai gambar ya. 😊', images: [] };
         }
-        let session = await getSession(userId);
-        session.upgrade_pending = true;
-        session.upgrade_from = 'free';
-        await saveSession(userId, session);
-        await logActivity(userId, 'upgrade_view', { current_tier: 'free' });  // ✅
-        return ctx.reply(
-            `🚀 *Pilih Paket Premium*\n\n` +
-            `1️⃣ GO — Rp35.000/bulan\n   ✅ Teks 75/hari + Voice 20/hari + Video 10/hari\n` +
-            `   ✅ Input: Teks, Suara, OCR\n` +
-            `   ✅ Output: Teks, Suara, Video\n\n` +
-            `2️⃣ PRO — Rp75.000/bulan\n   ✅ Teks 150/hari + Voice 50/hari + Video 30/hari\n` +
-            `   ✅ Semua fitur GO +\n` +
-            `   ✅ Model AI reasoning (DeepSeek)\n\n` +
-            `Balas dengan angka *1* (GO) atau *2* (PRO) ya, Kak~`
-        );
-    });
+        message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption || 'Jelaskan isi PDF ini.'}`;
+    }
 
-    bot.command('bayar', async (ctx) => {
-        const payload = ctx.message.text.split(' ')[1];
-        if (!payload) return ctx.reply('Ketik /bayar go atau /bayar pro.');
-        const pkg = (payload === 'pro' || payload === 'PRO') ? 'pro' : 'go';
-        await logActivity(ctx.from.id.toString(), 'payment_start', { package: pkg });  // ✅
-        await handlePayment(ctx, pkg);
-    });
-
-    bot.command('status', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const tier = await getUserTier(userId);
-        const r = await getAllRemaining(userId);
-        const tierName = tier === 'free' ? 'Free' : tier.toUpperCase();
-        return ctx.reply(`📊 *Status Yenni*\n\nTier: ${tierName}\nKuota hari ini:\n- Teks: ${r.text}\n- Gambar: ${r.image}\n- Voice: ${r.voice}\n- Video: ${r.ffmpeg || 0}`);
-    });
-
-    // Handler teks utama
-    bot.on('text', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const message = ctx.message.text;
-        let session = await getSession(userId);
-        let user = await getUser(userId);
-
-        if (session?.upgrade_pending) {
-            const choice = message.trim();
-            if (choice === '1' || choice === '2') {
-                let pkg;
-                if (session.upgrade_from === 'go' && choice === '2') pkg = 'pro';
-                else if (choice === '1') pkg = 'go';
-                else pkg = 'pro';
-                delete session.upgrade_pending;
-                delete session.upgrade_from;
-                await saveSession(userId, session);
-                await logActivity(userId, 'payment_start', { package: pkg });
-                return await handlePayment(ctx, pkg);
-            } else if (choice.startsWith('/')) {
-                delete session.upgrade_pending;
-                delete session.upgrade_from;
-                await saveSession(userId, session);
-            } else {
-                return ctx.reply('Silakan pilih *1* untuk GO atau *2* untuk PRO ya, Kak.');
-            }
+    if (message.startsWith('[PDF_TEXT]')) {
+        const pdfPart = message.substring(9);
+        const newlineIndex = pdfPart.indexOf('\n');
+        const caption = newlineIndex > -1 ? pdfPart.substring(0, newlineIndex).trim() : 'Jelaskan isi PDF ini.';
+        const pdfText = newlineIndex > -1 ? pdfPart.substring(newlineIndex + 1).trim() : pdfPart.trim();
+        if (!pdfText || pdfText.trim().length === 0) {
+            return { text: '📄 Tidak ada teks di PDF ini.', images: [] };
         }
+        message = `[Isi PDF]:\n${pdfText}\n\nPertanyaan pengguna: ${caption}`;
+    }
 
-        if (!user || !session?.level) {
-            const choice = message.trim();
-            let level, subLevel;
-            if (choice === '1') { level = 'sd-smp'; subLevel = 'sd-1-3'; }
-            else if (choice === '2') { level = 'sd-smp'; subLevel = 'sd-4-6'; }
-            else if (choice === '3') { level = 'sd-smp'; subLevel = 'smp'; }
-            else if (choice === '4') { level = 'sma-smk'; subLevel = 'sma'; }
-            else if (choice === '5') { level = 'sma-smk'; subLevel = 'smk'; }
-            else return ctx.reply('🙏 Maaf, balas dengan angka 1-5 ya.');
-            if (!user) {
-                await createUser(userId, 'telegram', level, subLevel);
-                await logActivity(userId, 'signup', { level, subLevel });  // ✅
-            } else {
-                await updateUserLevel(userId, level, subLevel);
-                await logActivity(userId, 'change_level', { level, subLevel });  // ✅
-            }
-            session = { level, subLevel, history: [] };
-            await saveSession(userId, session);
-            return ctx.reply(`✅ Siap! Kamu terdaftar sebagai siswa ${getUserLevelText(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
-        }
+    // 7. Search
+    const searchMatch = message.match(/cari(?:kan)?\s+(?:tentang\s+)?(.+)/i);
+    if (searchMatch) {
+        const query = searchMatch[1];
+        const searchSummary = await searchAndSummarize(query);
+        message = `Informasi dari pencarian web:\n${searchSummary}\n\nPertanyaan pengguna: ${message}`;
+    }
 
-        try { await ctx.sendChatAction('typing'); } catch (e) {}
+    // 8. Bangun prompt
+    const systemPrompt = buildSystemPrompt(session);
+    const context = await manageContext(userId, session, message);
+    const fullPrompt = `${systemPrompt}\n\n${context}\n\nUser: ${message}`;
 
-        try {
-            const result = await processMessage(userId, message, session, 'telegram');
-            await logActivity(userId, 'chat_text', { text: message.substring(0, 100) });  // ✅
-            await sendLongText(ctx, result.text);
-            for (const url of result.images) { try { await ctx.replyWithPhoto(url); } catch (e) {} }
-        } catch (error) {
-            logger.error('Telegram process error:', error);
-            await ctx.reply('😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.');
-        }
-    });
-
-    // Handler foto
-    bot.on('photo', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const session = await getSession(userId);
-        if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
-        const tier = await getUserTier(userId);
-        if (tier === 'free') return ctx.reply('📷 OCR hanya tersedia untuk paket GO dan PRO. Ketik /upgrade untuk upgrade ya~');
-
-        const imageQuota = await consumeQuota(userId, 'image');
-        if (!imageQuota.allowed) return ctx.reply('📷 Kuota gambar harian sudah habis!');
-
-        try { await ctx.sendChatAction('upload_photo'); } catch { await ctx.sendChatAction('typing'); }
-        try {
-            const photo = ctx.message.photo.pop();
-            const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
-            const cleanUrl = fileUrl.href.split('\n')[0].trim();
-            const caption = escapeHtml(ctx.message.caption || 'Jelaskan gambar ini.');
-            const result = await processMessage(userId, `[IMAGE]${cleanUrl}\n${caption}`, session, 'telegram');
-            await logActivity(userId, 'ocr_image');  // ✅
-            await sendLongText(ctx, result.text);
-            for (const url of result.images) { try { await ctx.replyWithPhoto(url); } catch (e) {} }
-        } catch (error) {
-            logger.error('Photo error:', error);
-            await ctx.reply('😔 Gambar tidak bisa diproses. Coba lagi ya.');
-        }
-    });
-
-    // Handler dokumen (PDF)
-    bot.on('document', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const session = await getSession(userId);
-        if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
-        const tier = await getUserTier(userId);
-        if (tier === 'free') return ctx.reply('📄 PDF hanya tersedia untuk paket GO dan PRO. Ketik /upgrade untuk upgrade ya~');
-        const doc = ctx.message.document;
-        if (!(doc.file_name || '').toLowerCase().endsWith('.pdf')) return ctx.reply('📎 Yenni hanya bisa membaca PDF.');
-        try { await ctx.sendChatAction('upload_document'); } catch { await ctx.sendChatAction('typing'); }
-        try {
-            const fileUrl = await ctx.telegram.getFileLink(doc.file_id);
-            const cleanUrl = fileUrl.href.split('\n')[0].trim();
-            const caption = escapeHtml(ctx.message.caption || 'Jelaskan isi PDF ini.');
-            const result = await processMessage(userId, `[PDF]${cleanUrl}\n${caption}`, session, 'telegram');
-            await logActivity(userId, 'pdf_read');  // ✅
-            await sendLongText(ctx, result.text);
-            for (const url of result.images) { try { await ctx.replyWithPhoto(url); } catch (e) {} }
-        } catch (error) {
-            logger.error('PDF error:', error);
-            await ctx.reply('😔 PDF tidak bisa diproses. Coba lagi ya.');
-        }
-    });
-
-    // Handler voice
-    bot.on('voice', async (ctx) => {
-        const userId = `telegram:${ctx.from.id}`;
-        const session = await getSession(userId);
-        if (!session?.level) return ctx.reply('Pilih jenjang dulu dengan /start ya.');
-        const tier = await getUserTier(userId);
-        if (tier === 'free') return ctx.reply('🎤 Voice note hanya tersedia untuk paket GO dan PRO. Ketik /upgrade untuk upgrade ya~');
-
-        const voiceQuota = await consumeQuota(userId, 'voice');
-        if (!voiceQuota.allowed) return ctx.reply('🎤 Kuota voice note Kakak sudah habis hari ini!');
-
-        try { await ctx.sendChatAction('record_voice'); } catch (e) {}
-        try {
-            const voice = ctx.message.voice;
-            if (voice.duration > 120) return ctx.reply('🎤 Maaf, maksimal 2 menit per voice note.');
-            const fileUrl = await ctx.telegram.getFileLink(voice.file_id);
-            const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
-            const audioBuffer = Buffer.from(response.data);
-            await ctx.reply('🎤 Yenni dengerin suara Kakak dulu ya...');
-            const transcribed = await transcribeAudio(audioBuffer, 'audio/ogg');
-            if (!transcribed || transcribed.trim().length === 0) return ctx.reply('🎤 Maaf, Yenni tidak bisa mendengar.');
-            await ctx.reply(`📝 Yenni dengar: "${transcribed}"`);
-            const result = await processMessage(userId, transcribed, session, 'telegram');
-            await logActivity(userId, 'voice_note', { duration: voice.duration });  // ✅
-            await sendLongText(ctx, result.text);
-            for (const url of result.images) { try { await ctx.replyWithPhoto(url); } catch (e) {} }
-        } catch (error) {
-            logger.error('Voice error:', error);
-            await ctx.reply('🎤 Suara tidak bisa diproses.');
-        }
-    });
-}
-
-async function handlePayment(ctx, pkg) {
-    const userId = `telegram:${ctx.from.id}`;
-    const user = await getUser(userId);
-    if (!user) return ctx.reply('Ketik /start dulu ya, Kak.');
+    // 9. Router pemilihan model (TIER-BASED)
+    let response;
     try {
-        const invoice = await createPaymentLink(userId, pkg, ctx.from.first_name);
-        return ctx.reply(
-            `💳 *Pembayaran Yenni ${PACKAGES[pkg].name}*\n\n` +
-            `Klik link berikut:\n${invoice.payment_link_url}\n\n` +
-            `QRIS & semua metode tersedia. Link berlaku 24 jam.\n` +
-            `Premium aktif otomatis setelah pembayaran.\n\nCek status: /status`
-        );
+        if (isSimpleMath(originalMessage)) {
+            try {
+                const result = Function(`"use strict"; return (${originalMessage})`)();
+                response = `✨ Hasil dari \`${originalMessage}\` adalah *${result}*`;
+                logger.info('Simple math evaluated locally');
+            } catch {
+                response = await routeModel(userId, fullPrompt, originalMessage);
+            }
+        } else {
+            response = await routeModel(userId, fullPrompt, originalMessage);
+        }
     } catch (error) {
-        logger.error('Payment error:', error);
-        return ctx.reply('😔 Gangguan pembayaran. Coba lagi nanti.');
+        logger.error('LLM error:', error);
+        return { text: '😔 Maaf, ada gangguan teknis. Coba lagi ya, Kak.', images: [] };
     }
-}
 
-async function sendLongText(ctx, text) {
-    if (text.length > 4000) {
-        for (const chunk of splitMessage(text, 4000)) await ctx.reply(chunk, { parse_mode: 'HTML' });
-    } else await ctx.reply(text, { parse_mode: 'HTML' });
-}
-
-function splitMessage(text, max) {
-    const chunks = []; let cur = '';
-    for (const w of text.split(' ')) {
-        if ((cur + ' ' + w).length > max) { chunks.push(cur.trim()); cur = w; }
-        else cur += (cur ? ' ' : '') + w;
+    // 10. Visualisasi
+    let responseText = response;
+    let images = [];
+    const vizRegex = /\[VISUALISASI\]([\s\S]*?)\[\/VISUALISASI\]/;
+    const match = responseText.match(vizRegex);
+    if (match) {
+        try {
+            const vizData = JSON.parse(match[1].trim());
+            let imageUrl = null;
+            if (vizData.type === 'latex') imageUrl = generateLatexUrl(vizData.data);
+            else if (vizData.type === 'chart') imageUrl = generateChartUrl(vizData.data);
+            if (imageUrl) {
+                images.push(imageUrl);
+                responseText = responseText.replace(vizRegex, '📊 *Lihat gambar visualisasi di bawah ini.*');
+            }
+        } catch (err) {
+            logger.error('Failed to parse visualization block:', err);
+            responseText = responseText.replace(vizRegex, '');
+        }
     }
-    if (cur) chunks.push(cur.trim());
-    return chunks;
+
+    // 11. Filter output untuk Free tier
+    const userTier = await getUserTier(userId);
+    if (userTier === 'free') {
+        images = [];
+        responseText = responseText.replace(/📊.*Lihat gambar.*/g, '');
+    }
+
+    // 12. Cache
+    if (!responseText.includes('gangguan teknis') && !responseText.includes('Maaf')) {
+        await setExactMatchCache(originalMessage, session.level, subLevel, responseText);
+        if (!isMediaMessage) {
+            await setSemanticCache(originalMessage, session.level, subLevel, responseText);
+        }
+    }
+
+    // 13. Simpan history
+    session.history = session.history || [];
+    session.history.push({ role: 'user', content: originalMessage });
+    session.history.push({ role: 'assistant', content: responseText });
+    await saveSession(userId, session);
+    await saveConversation(userId, 'user', originalMessage);
+    await saveConversation(userId, 'assistant', responseText);
+
+    // 14. DETEKSI INTENT UNTUK VOICE & VIDEO (GO/PRO)
+    let voicePath = null;
+    let videoPath = null;
+
+    if (userTier !== 'free' && responseText.length > 100) {
+        const topic = originalMessage.substring(0, 40);
+        const intent = await detectIntent(responseText, topic, session.history || []);
+
+        if (intent.voiceRecommended) {
+            const voiceQuota = await checkMediaQuota(userId, 'ffmpeg');
+            if (voiceQuota.allowed) {
+                try {
+                    const lang = detectLanguage(responseText);
+                    const voice = selectVoice(lang);
+                    const audioBuffer = await generateVoice(responseText, lang, voice);
+                    voicePath = path.join(os.tmpdir(), `yenni-voice-${Date.now()}.mp3`);
+                    fs.writeFileSync(voicePath, audioBuffer);
+                    await consumeQuota(userId, 'ffmpeg');
+                    logger.info('Voice auto-generated by intent');
+                } catch (e) {
+                    logger.error('Auto-voice generation failed:', e);
+                }
+            }
+        }
+
+        if (intent.videoRecommended) {
+            const videoQuota = await checkMediaQuota(userId, 'ffmpeg');
+            if (videoQuota.allowed) {
+                try {
+                    const imageUrl = await getImageUrl(topic);
+                    videoPath = await buildMedia(responseText, imageUrl);
+                    await consumeQuota(userId, 'ffmpeg');
+                    logger.info('Video auto-generated by intent');
+                } catch (e) {
+                    logger.error('Auto-video generation failed:', e);
+                }
+            }
+        }
+    }
+
+    // 15. Reminder upgrade (hanya free)
+    if (userTier === 'free') {
+        const remaining = await getAllRemaining(userId);
+        if (remaining.text === 0 && remaining.image === 0 && remaining.voice === 0) {
+            responseText += '\n\n⚠️ *Semua kuota gratis hari ini sudah habis!* Yuk upgrade ke Yenni GO atau PRO. Ketik /upgrade ~';
+        } else if (remaining.text <= 3) {
+            responseText += `\n\n💡 Sisa ${remaining.text} teks. Ketik /upgrade untuk langganan biar unlimited~`;
+        }
+    }
+
+    return { text: responseText, images, voicePath, videoPath };
 }
 
-function escapeHtml(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-function getUserLevelText(level, subLevel) {
-    const map = { 'sd-1-3':'SD Kelas 1-3','sd-4-6':'SD Kelas 4-6','smp':'SMP','sma':'SMA','smk':'SMK' };
-    return map[subLevel] || level;
-}
-
-module.exports = { setupTelegramHandler };
+module.exports = { processMessage };
