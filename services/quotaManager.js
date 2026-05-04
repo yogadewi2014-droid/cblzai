@@ -101,6 +101,37 @@ async function consumeQuota(userId, type) {
 }
 
 // ======================
+// CHECK MEDIA QUOTA (GO & PRO ONLY)
+// ======================
+async function checkMediaQuota(userId, type) {
+    if (!redis) {
+        return { allowed: false, remaining: 0, tier: 'free', reason: 'redis_down' };
+    }
+
+    const tier = await getUserTier(userId);
+    if (tier !== 'go' && tier !== 'pro') {
+        return {
+            allowed: false,
+            remaining: 0,
+            tier,
+            reason: 'Fitur ini hanya tersedia untuk paket GO dan PRO.'
+        };
+    }
+
+    const limits = LIMITS[tier];
+    if (!limits || !limits[type]) {
+        return {
+            allowed: false,
+            remaining: 0,
+            tier,
+            reason: 'Jenis media tidak valid.'
+        };
+    }
+
+    return await consumeQuota(userId, type);
+}
+
+// ======================
 // CHECK ONLY (OPTIONAL)
 // ======================
 async function checkQuota(userId, type) {
@@ -164,6 +195,7 @@ module.exports = {
 
     consumeQuota,     // 🔥 utama (pakai ini)
     checkQuota,       // opsional
+    checkMediaQuota,  // untuk GO & PRO (suara, video)
 
     getAllRemaining,
 
