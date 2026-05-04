@@ -1,82 +1,76 @@
 const axios = require('axios');
 const logger = require('../utils/logger');
 
-/**
- * Cari gambar dari Pexels (gratis 200 req/jam, 20.000/bulan).
- * @param {string} query - Kata kunci pencarian.
- * @param {number} timeout - Batas waktu dalam ms (default 3000).
- * @returns {Promise<string|null>} URL gambar atau null jika tidak ditemukan/gagal.
- */
-async function searchPexels(query, timeout = 3000) {
-    if (!process.env.PEXELS_API_KEY) {
-        logger.warn('PEXELS_API_KEY tidak diset. Pexels dilewati.');
+const cache = new Map();
+const CACHE_TTL = 1000 * 60 * 60 * 24; // 24 jam
+
+function buildImageCacheKey(query) {
+    return `img:${query.toLowerCase()}`;
+}
+
+function setCache(key, value) {
+    cache.set(key, {
+        value,
+        expires: Date.now() + CACHE_TTL
+    });
+}
+
+function getCache(key) {
+    const item = cache.get(key);
+    if (!item) return null;
+    if (Date.now() > item.expires) {
+        cache.delete(key);
         return null;
     }
+    return item.value;
+}
+
+async function searchPexels(query, timeout = 2000) {
+    if (!process.env.PEXELS_API_KEY) return null;
     try {
         const resp = await axios.get('https://api.pexels.com/v1/search', {
             headers: { Authorization: process.env.PEXELS_API_KEY },
-            params: { query, per_page: 1, orientation: 'landscape' },
-            timeout: timeout
+            params: { query: `${query} illustration`, per_page: 1 },
+            timeout
         });
-        const photos = resp.data?.photos;
-        if (photos && photos.length > 0) {
-            logger.info(`Pexels image ditemukan: ${photos[0].src.large}`);
-            return photos[0].src.large;
-        }
-        return null;
-    } catch (error) {
-        logger.error('Pexels search error:', error.message);
+        return resp.data?.photos?.[0]?.src?.medium || null;
+    } catch {
         return null;
     }
 }
 
-/**
- * Cari gambar dari Wikimedia Commons (gratis, tanpa API key).
- * @param {string} query - Kata kunci pencarian.
- * @param {number} timeout - Batas waktu dalam ms (default 3000).
- * @returns {Promise<string|null>} URL gambar atau null.
- */
-async function searchWikimedia(query, timeout = 3000) {
+async function searchWikimedia(query, timeout = 2000) {
     try {
-        const url = `https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srnamespace=6&format=json&origin=*`;
-        const resp = await axios.get(url, { timeout: timeout });
-        const results = resp.data?.query?.search;
-        if (results && results.length > 0) {
-            const title = results[0].title.replace(/^File:/, '');
-            const imageUrl = `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(title)}`;
-            logger.info(`Wikimedia image: ${imageUrl}`);
-            return imageUrl;
-        }
-        return null;
-    } catch (error) {
-        logger.error('Wikimedia search error:', error.message);
+        const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)} diagram&gsrlimit=1&prop=imageinfo&iiprop=url&format=json&origin=*`;
+        const resp = await axios.get(url, { timeout });
+        const pages = resp.data?.query?.pages;
+        if (!pages) return null;
+        const first = Object.values(pages)[0];
+        return first?.imageinfo?.[0]?.url || null;
+    } catch {
         return null;
     }
 }
 
-/**
- * Balapan kedua API; kembalikan URL dari yang pertama berhasil.
- * @param {string} query - Kata kunci topik.
- * @param {number} timeout - Batas waktu per API (default 3000 ms).
- * @returns {Promise<string>} URL gambar, fallback ke gambar default jika semuanya gagal.
- */
-async function getImageUrl(query, timeout = 3000) {
-    const [pexelResult, wikimediaResult] = await Promise.allSettled([
-        searchPexels(query, timeout),
-        searchWikimedia(query, timeout)
-    ]);
+async function getImageUrl(query) {
+    const key = buildImageCacheKey(query);
 
-    // Ambil hasil pertama yang berhasil
-    if (pexelResult.status === 'fulfilled' && pexelResult.value) {
-        return pexelResult.value;
-    }
-    if (wikimediaResult.status === 'fulfilled' && wikimediaResult.value) {
-        return wikimediaResult.value;
+    // ✅ cache hit
+    const cached = getCache(key);
+    if (cached) return cached;
+
+    // ✅ race (ambil tercepat)
+    const result = await Promise.any([
+        searchPexels(query),
+        searchWikimedia(query)
+    ]).catch(() => null);
+
+    if (result) {
+        setCache(key, result);
+        return result;
     }
 
-    // Fallback ke gambar default
-    logger.warn(`Tidak ada gambar ditemukan untuk "${query}", pakai default.`);
     return '/app/assets/learning-bg.png';
 }
 
-module.exports = { getImageUrl, buildImageCacheKey };
+module.exports = { getImageUrl };
