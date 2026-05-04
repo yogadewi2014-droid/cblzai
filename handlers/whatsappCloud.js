@@ -5,7 +5,7 @@ const { transcribeAudio } = require('../services/speechToText');
 const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor');
 const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
-const { getUserTier, checkTypeQuota, incrementTypeQuota, getAllRemaining } = require('../services/quotaManager');
+const { getUserTier, consumeQuota, getAllRemaining } = require('../services/quotaManager');
 const { createPaymentLink, PACKAGES } = require('../services/midtrans');
 const axios = require('axios');
 const logger = require('../utils/logger');
@@ -138,8 +138,8 @@ async function processIncomingMessage(msg) {
         const tier = await getUserTier(userId);
         if (tier === 'free') return sendText(from, '📷 OCR hanya tersedia untuk paket GO dan PRO. Ketik "upgrade" untuk upgrade ya~');
 
-        const imageQuota = await checkTypeQuota(userId, 'image');
-        if (!imageQuota.allowed) return sendText(from, '📷 Kuota gambar harian sudah habis. Upgrade ke paket lebih tinggi ya.');
+        const imageQuota = await consumeQuota(userId, 'image');
+        if (!imageQuota.allowed) return sendText(from, '📷 Kuota gambar harian sudah habis.');
 
         try {
             const imageId = (msg.image || {}).id;
@@ -147,7 +147,6 @@ async function processIncomingMessage(msg) {
             const imageUrl = await getMediaUrl(imageId);
             const imageBuffer = await downloadFile(imageUrl);
             let compressed; try { compressed = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 }); } catch { compressed = imageBuffer; }
-            await incrementTypeQuota(userId, 'image');
             const result = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', compressed);
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
@@ -161,7 +160,7 @@ async function processIncomingMessage(msg) {
         const tier = await getUserTier(userId);
         if (tier === 'free') return sendText(from, '🎤 Voice note hanya tersedia untuk paket GO dan PRO. Ketik "upgrade" untuk upgrade ya~');
 
-        const voiceQuota = await checkTypeQuota(userId, 'voice');
+        const voiceQuota = await consumeQuota(userId, 'voice');
         if (!voiceQuota.allowed) return sendText(from, '🎤 Kuota voice note sudah habis hari ini!');
 
         try {
@@ -173,7 +172,6 @@ async function processIncomingMessage(msg) {
             const transcribed = await transcribeAudio(audioBuffer, 'audio/ogg');
             if (!transcribed) return sendText(from, '🎤 Maaf, tidak bisa mendengar.');
             await sendText(from, `📝 Yenni dengar: "${transcribed}"`);
-            await incrementTypeQuota(userId, 'voice');
             const result = await processMessage(userId, transcribed, session, 'whatsapp');
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
