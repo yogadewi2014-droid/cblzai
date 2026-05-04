@@ -7,6 +7,7 @@ const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
 const { getUserTier, consumeQuota, getAllRemaining } = require('../services/quotaManager');
 const { createPaymentLink, PACKAGES } = require('../services/midtrans');
+const { logActivity } = require('../services/crmService');  // ✅ CRM
 const axios = require('axios');
 const logger = require('../utils/logger');
 
@@ -56,6 +57,7 @@ async function processIncomingMessage(msg) {
                 delete session.upgrade_pending;
                 delete session.upgrade_from;
                 await saveSession(userId, session);
+                await logActivity(userId, 'payment_start', { package: pkg });  // ✅
                 return await handlePaymentWA(from, userId, pkg);
             } else if (text.startsWith('/') || text === 'status' || text === 'ganti level' || text === 'upgrade') {
                 delete session.upgrade_pending;
@@ -76,8 +78,13 @@ async function processIncomingMessage(msg) {
                 else if (text === '3') { level = 'sd-smp'; subLevel = 'smp'; }
                 else if (text === '4') { level = 'sma-smk'; subLevel = 'sma'; }
                 else if (text === '5') { level = 'sma-smk'; subLevel = 'smk'; }
-                if (!user) await createUser(userId, 'whatsapp', level, subLevel);
-                else await updateUserLevel(userId, level, subLevel);
+                if (!user) {
+                    await createUser(userId, 'whatsapp', level, subLevel);
+                    await logActivity(userId, 'signup', { level, subLevel });  // ✅
+                } else {
+                    await updateUserLevel(userId, level, subLevel);
+                    await logActivity(userId, 'change_level', { level, subLevel });  // ✅
+                }
                 session = { level, subLevel, history: [] };
                 await saveSession(userId, session);
                 return sendText(from, `✅ Siap! Kamu terdaftar sebagai siswa ${getWAlevel(level, subLevel)}.\nSekarang, tanya apa saja ya! 😊`);
@@ -90,6 +97,7 @@ async function processIncomingMessage(msg) {
             session.level = null; session.subLevel = null;
             delete session.upgrade_pending;
             await saveSession(userId, session);
+            await logActivity(userId, 'change_level');  // ✅
             return sendText(from, `🔁 Kakak mau pindah ke jenjang mana?\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK`);
         }
 
@@ -101,17 +109,20 @@ async function processIncomingMessage(msg) {
                 session.upgrade_pending = true;
                 session.upgrade_from = 'go';
                 await saveSession(userId, session);
+                await logActivity(userId, 'upgrade_view', { current_tier: 'go' });  // ✅
                 return sendText(from, `🚀 Upgrade ke PRO\n\nKakak saat ini di paket GO. Upgrade ke PRO untuk dapatkan:\n✅ Teks 150/hari + Voice 50/hari + Video 30/hari\n✅ Model AI reasoning\n\nHarga: Rp75.000/bulan\nBalas 2 untuk upgrade ke PRO.`);
             }
             session.upgrade_pending = true;
             session.upgrade_from = 'free';
             await saveSession(userId, session);
+            await logActivity(userId, 'upgrade_view', { current_tier: 'free' });  // ✅
             return sendText(from, `🚀 Pilih Paket Premium\n\n1. GO — Rp35.000/bulan\n   ✅ Teks 75/hari + Voice 20/hari + Video 10/hari\n   ✅ Input: Teks, Suara, OCR\n2. PRO — Rp75.000/bulan\n   ✅ Semua fitur GO + lebih banyak\nBalas 1 atau 2`);
         }
 
         // 4. Perintah langsung bayar
         if (text.startsWith('bayar')) {
             const pkg = text.includes('pro') ? 'pro' : 'go';
+            await logActivity(userId, 'payment_start', { package: pkg });  // ✅
             return await handlePaymentWA(from, userId, pkg);
         }
 
@@ -126,6 +137,7 @@ async function processIncomingMessage(msg) {
         // 6. Proses chat normal
         try {
             const result = await processMessage(userId, text, session, 'whatsapp');
+            await logActivity(userId, 'chat_text', { text: text.substring(0, 100) });  // ✅
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA process error:', error);
@@ -148,6 +160,7 @@ async function processIncomingMessage(msg) {
             const imageBuffer = await downloadFile(imageUrl);
             let compressed; try { compressed = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 }); } catch { compressed = imageBuffer; }
             const result = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', compressed);
+            await logActivity(userId, 'ocr_image');  // ✅
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA image error:', error);
@@ -173,6 +186,7 @@ async function processIncomingMessage(msg) {
             if (!transcribed) return sendText(from, '🎤 Maaf, tidak bisa mendengar.');
             await sendText(from, `📝 Yenni dengar: "${transcribed}"`);
             const result = await processMessage(userId, transcribed, session, 'whatsapp');
+            await logActivity(userId, 'voice_note', { duration: (msg.audio || msg.voice || {}).duration });  // ✅
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA voice error:', error);
@@ -193,6 +207,7 @@ async function processIncomingMessage(msg) {
             let pdfText; try { pdfText = await extractTextFromPDF(docBuffer); } catch { return sendText(from, 'Gagal membaca PDF.'); }
             if (!pdfText) return sendText(from, '📄 PDF ini hasil scan. Kirim fotonya sebagai gambar ya.');
             const result = await processMessage(userId, `[PDF_TEXT]${doc.caption || 'Jelaskan isi PDF ini.'}\n${pdfText}`, session, 'whatsapp');
+            await logActivity(userId, 'pdf_read');  // ✅
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA doc error:', error);
