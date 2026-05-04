@@ -1,11 +1,17 @@
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 const logger = require('../utils/logger');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+        realtime: {
+            transport: WebSocket
+        }
+    }
+);
 
-/**
- * Catat aktivitas pengguna dan update user stats (pakai function SQL)
- */
 async function logActivity(userId, eventType, metadata = {}) {
     try {
         const { error } = await supabase.rpc('log_user_activity', {
@@ -25,9 +31,6 @@ async function logActivity(userId, eventType, metadata = {}) {
     }
 }
 
-/**
- * Dapatkan data CRM satu user
- */
 async function getUserCrm(userId) {
     try {
         const { data, error } = await supabase.rpc('get_user_crm', { uid: userId });
@@ -42,9 +45,6 @@ async function getUserCrm(userId) {
     }
 }
 
-/**
- * Dapatkan daftar user yang perlu follow-up (inactive 1d / 7d)
- */
 async function getUsersForFollowup() {
     try {
         const { data, error } = await supabase.rpc('get_users_for_followup');
@@ -59,9 +59,6 @@ async function getUsersForFollowup() {
     }
 }
 
-/**
- * Update segmentasi (bisa dipanggil berkala via cron)
- */
 async function updateUserSegments() {
     try {
         const { error } = await supabase.rpc('update_user_segments');
