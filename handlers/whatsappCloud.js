@@ -5,10 +5,14 @@ const { transcribeAudio } = require('../services/speechToText');
 const { compressImage, extractTextFromPDF } = require('../utils/imageProcessor');
 const { extractTextFromImage } = require('../services/vision');
 const { downloadFile } = require('../utils/downloader');
-const { getUserTier, consumeQuota, getAllRemaining } = require('../services/quotaManager');
+const { getUserTier, consumeQuota, getAllRemaining, checkMediaQuota } = require('../services/quotaManager');
 const { createPaymentLink, PACKAGES } = require('../services/midtrans');
-const { logActivity } = require('../services/crmService');  // ✅ CRM
+const { logActivity } = require('../services/crmService');
 const axios = require('axios');
+const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const logger = require('../utils/logger');
 
 const WA_API_URL = `https://graph.facebook.com/v22.0/${process.env.WA_PHONE_NUMBER_ID}/messages`;
@@ -36,6 +40,59 @@ async function handleWebhook(req, res) {
     }
 }
 
+async function sendAudioMessage(to, buffer) {
+    try {
+        const form = new FormData();
+        form.append('file', buffer, { filename: 'audio.mp3', contentType: 'audio/mpeg' });
+        form.append('messaging_product', 'whatsapp');
+        form.append('type', 'audio/mpeg');
+
+        const uploadRes = await axios.post(
+            `https://graph.facebook.com/v22.0/${process.env.WA_PHONE_NUMBER_ID}/media`,
+            form,
+            { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, ...form.getHeaders() } }
+        );
+        const mediaId = uploadRes.data.id;
+
+        await axios.post(WA_API_URL, {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to,
+            type: 'audio',
+            audio: { id: mediaId }
+        }, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+    } catch (error) {
+        logger.error('sendAudioMessage error:', error.response?.data || error.message);
+    }
+}
+
+async function sendVideoMessage(to, filePath) {
+    try {
+        const fileBuffer = fs.readFileSync(filePath);
+        const form = new FormData();
+        form.append('file', fileBuffer, { filename: 'video.mp4', contentType: 'video/mp4' });
+        form.append('messaging_product', 'whatsapp');
+        form.append('type', 'video/mp4');
+
+        const uploadRes = await axios.post(
+            `https://graph.facebook.com/v22.0/${process.env.WA_PHONE_NUMBER_ID}/media`,
+            form,
+            { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, ...form.getHeaders() } }
+        );
+        const mediaId = uploadRes.data.id;
+
+        await axios.post(WA_API_URL, {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to,
+            type: 'video',
+            video: { id: mediaId }
+        }, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+    } catch (error) {
+        logger.error('sendVideoMessage error:', error.response?.data || error.message);
+    }
+}
+
 async function processIncomingMessage(msg) {
     const from = msg.from;
     const userId = `whatsapp:${from}`;
@@ -46,7 +103,6 @@ async function processIncomingMessage(msg) {
     if (msg.type === 'text') {
         const text = (msg.text?.body || '').trim();
 
-        // 0. State upgrade_pending: menunggu pilihan 1/2
         if (session?.upgrade_pending) {
             const choice = text;
             if (choice === '1' || choice === '2') {
@@ -57,7 +113,7 @@ async function processIncomingMessage(msg) {
                 delete session.upgrade_pending;
                 delete session.upgrade_from;
                 await saveSession(userId, session);
-                await logActivity(userId, 'payment_start', { package: pkg });  // ✅
+                await logActivity(userId, 'payment_start', { package: pkg });
                 return await handlePaymentWA(from, userId, pkg);
             } else if (text.startsWith('/') || text === 'status' || text === 'ganti level' || text === 'upgrade') {
                 delete session.upgrade_pending;
@@ -68,7 +124,6 @@ async function processIncomingMessage(msg) {
             }
         }
 
-        // 1. Onboarding
         if (!user || !session?.level) {
             if (!session) session = { level: null, subLevel: null, history: [] };
             if (['1','2','3','4','5'].includes(text)) {
@@ -80,10 +135,10 @@ async function processIncomingMessage(msg) {
                 else if (text === '5') { level = 'sma-smk'; subLevel = 'smk'; }
                 if (!user) {
                     await createUser(userId, 'whatsapp', level, subLevel);
-                    await logActivity(userId, 'signup', { level, subLevel });  // ✅
+                    await logActivity(userId, 'signup', { level, subLevel });
                 } else {
                     await updateUserLevel(userId, level, subLevel);
-                    await logActivity(userId, 'change_level', { level, subLevel });  // ✅
+                    await logActivity(userId, 'change_level', { level, subLevel });
                 }
                 session = { level, subLevel, history: [] };
                 await saveSession(userId, session);
@@ -92,16 +147,14 @@ async function processIncomingMessage(msg) {
             return sendText(from, `👋 Halo! Aku Yenni, asisten belajar AI.\nPilih jenjang pendidikanmu dulu yuk:\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK\n\nBalas dengan *angka* pilihanmu ya.`);
         }
 
-        // 2. Perintah ganti level
         if (text === 'ganti level' || text === '/ganti_level') {
             session.level = null; session.subLevel = null;
             delete session.upgrade_pending;
             await saveSession(userId, session);
-            await logActivity(userId, 'change_level');  // ✅
+            await logActivity(userId, 'change_level');
             return sendText(from, `🔁 Kakak mau pindah ke jenjang mana?\n\n1️⃣ SD Kelas 1-3\n2️⃣ SD Kelas 4-6\n3️⃣ SMP\n4️⃣ SMA\n5️⃣ SMK`);
         }
 
-        // 3. Perintah upgrade
         if (text === 'upgrade' || text === '/upgrade') {
             const tier = await getUserTier(userId);
             if (tier === 'pro') return sendText(from, '✨ Kakak sudah menjadi member Yenni PRO!');
@@ -109,24 +162,22 @@ async function processIncomingMessage(msg) {
                 session.upgrade_pending = true;
                 session.upgrade_from = 'go';
                 await saveSession(userId, session);
-                await logActivity(userId, 'upgrade_view', { current_tier: 'go' });  // ✅
+                await logActivity(userId, 'upgrade_view', { current_tier: 'go' });
                 return sendText(from, `🚀 Upgrade ke PRO\n\nKakak saat ini di paket GO. Upgrade ke PRO untuk dapatkan:\n✅ Teks 150/hari + Voice 50/hari + Video 30/hari\n✅ Model AI reasoning\n\nHarga: Rp75.000/bulan\nBalas 2 untuk upgrade ke PRO.`);
             }
             session.upgrade_pending = true;
             session.upgrade_from = 'free';
             await saveSession(userId, session);
-            await logActivity(userId, 'upgrade_view', { current_tier: 'free' });  // ✅
+            await logActivity(userId, 'upgrade_view', { current_tier: 'free' });
             return sendText(from, `🚀 Pilih Paket Premium\n\n1. GO — Rp35.000/bulan\n   ✅ Teks 75/hari + Voice 20/hari + Video 10/hari\n   ✅ Input: Teks, Suara, OCR\n2. PRO — Rp75.000/bulan\n   ✅ Semua fitur GO + lebih banyak\nBalas 1 atau 2`);
         }
 
-        // 4. Perintah langsung bayar
         if (text.startsWith('bayar')) {
             const pkg = text.includes('pro') ? 'pro' : 'go';
-            await logActivity(userId, 'payment_start', { package: pkg });  // ✅
+            await logActivity(userId, 'payment_start', { package: pkg });
             return await handlePaymentWA(from, userId, pkg);
         }
 
-        // 5. Perintah status
         if (text === 'status' || text === '/status') {
             const tier = await getUserTier(userId);
             const r = await getAllRemaining(userId);
@@ -134,11 +185,64 @@ async function processIncomingMessage(msg) {
             return sendText(from, `📊 Status Yenni\n\nTier: ${tierName}\nKuota hari ini:\n- Teks: ${r.text}\n- Gambar: ${r.image}\n- Voice: ${r.voice}\n- Video: ${r.ffmpeg || 0}`);
         }
 
-        // 6. Proses chat normal
+        if (text.startsWith('/suarakan')) {
+            if (await getUserTier(userId) === 'free') return sendText(from, 'Fitur ini hanya untuk pengguna GO dan PRO.');
+            const ttsText = text.replace('/suarakan', '').trim();
+            if (!ttsText) return sendText(from, 'Tulis teks yang ingin disuarakan. Contoh: /suarakan Halo, apa kabar?');
+
+            const quotaCheck = await checkMediaQuota(userId, 'ffmpeg');
+            if (!quotaCheck.allowed) return sendText(from, quotaCheck.reason || 'Kuota harian sudah habis.');
+
+            try {
+                const { generateVoice, detectLanguage, selectVoice } = require('../services/voiceOutput');
+                const lang = detectLanguage(ttsText);
+                const voice = selectVoice(lang);
+                const audioBuffer = await generateVoice(ttsText, lang, voice);
+                await sendAudioMessage(from, audioBuffer);
+                await consumeQuota(userId, 'ffmpeg');
+            } catch (error) {
+                logger.error('Voice error:', error);
+                sendText(from, 'Maaf, ada gangguan saat membuat suara.');
+            }
+        }
+
+        if (text.startsWith('/video')) {
+            if (await getUserTier(userId) === 'free') return sendText(from, 'Fitur ini hanya untuk pengguna GO dan PRO.');
+            const videoText = text.replace('/video', '').trim();
+            if (!videoText) return sendText(from, 'Tulis teks untuk video. Contoh: /video Fotosintesis pada tumbuhan.');
+
+            const quotaCheck = await checkMediaQuota(userId, 'ffmpeg');
+            if (!quotaCheck.allowed) return sendText(from, quotaCheck.reason || 'Kuota harian sudah habis.');
+
+            try {
+                const { buildMedia } = require('../services/videoMaker');
+                const { getImageUrl } = require('../services/imageSource');
+                const topic = videoText.substring(0, 50);
+                const imageUrl = await getImageUrl(topic);
+                const videoPath = await buildMedia(videoText, imageUrl);
+                await sendVideoMessage(from, videoPath);
+                if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+                await consumeQuota(userId, 'ffmpeg');
+            } catch (error) {
+                logger.error('Video error:', error);
+                sendText(from, 'Maaf, ada gangguan saat membuat video.');
+            }
+        }
+
         try {
             const result = await processMessage(userId, text, session, 'whatsapp');
-            await logActivity(userId, 'chat_text', { text: text.substring(0, 100) });  // ✅
+            await logActivity(userId, 'chat_text', { text: text.substring(0, 100) });
+
             await sendLongTextWA(from, result.text, result.images);
+
+            if (result.voicePath && fs.existsSync(result.voicePath)) {
+                await sendAudioMessage(from, fs.readFileSync(result.voicePath));
+                fs.unlinkSync(result.voicePath);
+            }
+            if (result.videoPath && fs.existsSync(result.videoPath)) {
+                await sendVideoMessage(from, result.videoPath);
+                if (fs.existsSync(result.videoPath)) fs.unlinkSync(result.videoPath);
+            }
         } catch (error) {
             logger.error('WA process error:', error);
             await sendText(from, '😔 Maaf, ada gangguan. Coba lagi ya.');
@@ -160,7 +264,7 @@ async function processIncomingMessage(msg) {
             const imageBuffer = await downloadFile(imageUrl);
             let compressed; try { compressed = await compressImage(imageBuffer, { maxWidth: 1024, quality: 80 }); } catch { compressed = imageBuffer; }
             const result = await processMessage(userId, `[IMAGE_BUFFER]${caption}`, session, 'whatsapp', compressed);
-            await logActivity(userId, 'ocr_image');  // ✅
+            await logActivity(userId, 'ocr_image');
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA image error:', error);
@@ -186,7 +290,7 @@ async function processIncomingMessage(msg) {
             if (!transcribed) return sendText(from, '🎤 Maaf, tidak bisa mendengar.');
             await sendText(from, `📝 Yenni dengar: "${transcribed}"`);
             const result = await processMessage(userId, transcribed, session, 'whatsapp');
-            await logActivity(userId, 'voice_note', { duration: (msg.audio || msg.voice || {}).duration });  // ✅
+            await logActivity(userId, 'voice_note', { duration: (msg.audio || msg.voice || {}).duration });
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA voice error:', error);
@@ -207,7 +311,7 @@ async function processIncomingMessage(msg) {
             let pdfText; try { pdfText = await extractTextFromPDF(docBuffer); } catch { return sendText(from, 'Gagal membaca PDF.'); }
             if (!pdfText) return sendText(from, '📄 PDF ini hasil scan. Kirim fotonya sebagai gambar ya.');
             const result = await processMessage(userId, `[PDF_TEXT]${doc.caption || 'Jelaskan isi PDF ini.'}\n${pdfText}`, session, 'whatsapp');
-            await logActivity(userId, 'pdf_read');  // ✅
+            await logActivity(userId, 'pdf_read');
             await sendLongTextWA(from, result.text, result.images);
         } catch (error) {
             logger.error('WA doc error:', error);
@@ -216,7 +320,6 @@ async function processIncomingMessage(msg) {
     }
 }
 
-// Helper: proses pembayaran WhatsApp
 async function handlePaymentWA(from, userId, pkg) {
     try {
         const invoice = await createPaymentLink(userId, pkg);
@@ -231,7 +334,6 @@ async function handlePaymentWA(from, userId, pkg) {
     }
 }
 
-// --- Utilitas ---
 async function sendText(to, text) {
     try {
         await axios.post(WA_API_URL, {
@@ -275,7 +377,7 @@ function splitWA(text, max) {
 }
 
 function getWAlevel(level, subLevel) {
-    const map = { 'sd-1-3':'SD Kelas 1-3','sd-4-6':'SD Kelas 4-6','smp':'SMP','sma':'SMA','smk':'SMK' };
+    const map = { 'sd-1-3': 'SD Kelas 1-3', 'sd-4-6': 'SD Kelas 4-6', 'smp': 'SMP', 'sma': 'SMA', 'smk': 'SMK' };
     return map[subLevel] || level;
 }
 
