@@ -15,8 +15,8 @@ if (config.upstashRedisUrl && config.upstashRedisToken) {
 // ======================
 const LIMITS = {
     free: { text: 10, image: 0, voice: 0, ffmpeg: 0 },
-    go:   { text: 75, image: 5, voice: 20, ffmpeg: 10 },
-    pro:  { text: 150, image: 10, voice: 50, ffmpeg: 30 }
+    go:   { text: 125, image: 10, voice: 30, ffmpeg: 20 },
+    pro:  { text: 200, image: 20, voice: 60, ffmpeg: 40 }
 };
 
 // ======================
@@ -74,14 +74,15 @@ async function consumeQuota(userId, type) {
     const count = await redis.incr(key);
 
     // set TTL saat pertama kali
-    if (count === 1) {
-        const now = new Date();
-        const endOfDay = new Date(now);
-        endOfDay.setHours(24, 0, 0, 0);
+if (count === 1) {
+    // Dapatkan waktu sekarang dalam timezone WITA
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Makassar' }));
+    const endOfDay = new Date(now);
+    endOfDay.setHours(24, 0, 0, 0); // jam 24:00 WITA
 
-        const ttl = Math.floor((endOfDay - now) / 1000);
-        await redis.expire(key, ttl);
-    }
+    const ttl = Math.floor((endOfDay - now) / 1000);
+    await redis.expire(key, ttl);
+}
 
     if (count > limit) {
         return {
